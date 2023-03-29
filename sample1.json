@@ -1,0 +1,40 @@
+[
+  {
+    "chapter": 4,
+    "type": "blank",
+    "question": "The remote procedure call (RPC) model has been around since the ________.",
+    "answer": "1970s"
+  },
+  {
+    "chapter": 4,
+    "type": "blank",
+    "question": "One of the factors that differentiate network requests from local function calls is that network requests can experience ________, which may cause them to return without a result.",
+    "answer": "timeouts"
+  },
+  {
+    "chapter": 4,
+    "type": "multiple-choice",
+    "question": "Which technology mentioned in the text is limited to Java?",
+    "options": ["Enterprise JavaBeans (EJB)", "Distributed Component Object Model (DCOM)", "Common Object Request Broker Architecture (CORBA)", "Representational State Transfer (REST)"],
+    "answer": "Enterprise JavaBeans (EJB)"
+  },
+  {
+    "chapter": 4,
+    "type": "multiple-choice",
+    "question": "What is a potential issue when translating datatypes from one programming language to another in an RPC framework?",
+    "options": ["Network latency", "Language-specific data type differences", "Increased security risks", "Reduced processing power"],
+    "answer": "Language-specific data type differences"
+  },
+  {
+    "chapter": 4,
+    "type": "concept",
+    "question": "Explain the difference between a local function call and a network request in terms of predictability and control over parameters.",
+    "answer": "A local function call is predictable and its success or failure depends only on parameters that are under the developer's control. In contrast, a network request is unpredictable because it can be affected by external factors such as network problems or remote machine unavailability, which are outside of the developer's control."
+  },
+  {
+    "chapter": 4,
+    "type": "concept",
+    "question": "Describe the concept of idempotence in the context of retrying failed network requests and why it is necessary.",
+    "answer": "Idempotence refers to the property of an action that can be performed multiple times without changing the result beyond the initial application. In the context of retrying failed network requests, idempotence is necessary to prevent duplication of actions. When a network request is retried, it is possible that the original request was successful, but the response was lost. Without idempotence, retrying the request could cause the action to be performed multiple times, leading to undesirable effects. By building a mechanism for deduplication (idempotence) into the protocol, the system can handle retries without duplicating actions."
+  }
+]
