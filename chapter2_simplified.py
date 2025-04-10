@@ -49,10 +49,6 @@ learning_rate = 0.001
 # Training loop
 for epoch in range(epochs):
     print(f"Epoch {epoch + 1}/{epochs}")
-    indices = np.arange(train_images.shape[0])
-    np.random.shuffle(indices)
-    train_images = train_images[indices]
-    train_labels = train_labels[indices]
 
     for i in range(0, train_images.shape[0], batch_size):
         x_batch = train_images[i:i+batch_size]
