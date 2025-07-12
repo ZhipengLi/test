@@ -1,37 +1,9 @@
 import numpy as np
-from tensorflow.keras.datasets import mnist
-import gzip
-import os
-import urllib.request
+from load_data import load_mnist_with_cache
 
 # Load MNIST data
-(train_images, train_labels), (test_images, test_labels) = mnist.load_data()
+(train_images, train_labels), (test_images, test_labels) = load_mnist_with_cache()
 print(train_images.shape)
-
-
-# Function to download and load MNIST dataset
-# def load_mnist():
-#     base_url = 'http://yann.lecun.com/exdb/mnist/'
-#     files = {
-#         'train_images': 'train-images-idx3-ubyte.gz',
-#         'train_labels': 'train-labels-idx1-ubyte.gz',
-#         'test_images': 't10k-images-idx3-ubyte.gz',
-#         'test_labels': 't10k-labels-idx1-ubyte.gz',
-#     }
-#     data = {}
-#     for key, filename in files.items():
-#         if not os.path.exists(filename):
-#             print(f'Downloading {filename}...')
-#             urllib.request.urlretrieve(base_url + filename, filename)
-#         with gzip.open(filename, 'rb') as f:
-#             if 'images' in key:
-#                 data[key] = np.frombuffer(f.read(), np.uint8, offset=16).reshape(-1, 28, 28) / 255.0
-#             else:
-#                 data[key] = np.frombuffer(f.read(), np.uint8, offset=8)
-#     return data['train_images'], data['train_labels'], data['test_images'], data['test_labels']
-
-# Load data
-# train_images, train_labels, test_images, test_labels = load_mnist()
 
 # Use a subset for faster training (optional)
 train_images = train_images[:1000]
@@ -124,6 +96,9 @@ for epoch in range(epochs):
         # Backward pass
         # Gradient of loss w.r.t. dense layer output
         grad_output = x_prob
+        # if x_prob = [0.1, 0.7, 0.2], one-hot encoding for label 1 is [0, 1, 0]
+        # then it is [0.1, 0.7, 0.2] - [0, 1, 0] = [0.1, -0.3, 0.2]
+        # which is equivalent to subtracting 1 from the predicted probability of the true label
         grad_output[label] -= 1
 
         # Gradients for dense layer
