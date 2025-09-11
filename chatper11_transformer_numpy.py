@@ -1,3 +1,4 @@
+# imdb dataset: https://ai.stanford.edu/~amaas/data/sentiment/aclImdb_v1.tar.gz
 # import os
 # import re
 # import math
