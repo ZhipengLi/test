@@ -516,7 +516,6 @@ class TransformerEncoderBlock:
 # Model
 # ----------------------------
 # This class assembles all the layers into a complete model for text classification.
-
 class NumPyTransformerClassifier:
     """
     A full Transformer-based binary classifier for text data.
@@ -527,7 +526,6 @@ class NumPyTransformerClassifier:
         self.pool = GlobalMaxPool1D()
         self.drop = Dropout(dropout_p, seed=seed + 100)
         self.out = Dense(embed_dim, 1, name_prefix="out", seed=seed + 101)
-        self.training = True
 
     @property
     def params(self):
@@ -546,47 +544,45 @@ class NumPyTransformerClassifier:
         # Defines the forward pass of the entire network.
         # Input IDs are converted to embeddings, passed through the encoder,
         # pooled to a fixed size, and then passed through a final dense layer and sigmoid.
-        self.training = training
-        h = self.embed.forward(x_ids)
-        h = self.encoder.forward(h, training=training)
-        h = self.pool.forward(h)
+
+        h = self.embed.forward(x_ids) #x_ids.shape=(64,256) -> h.shape=(64,256,256)
+        h = self.encoder.forward(h, training=training) # h.shape=(64,256,256) -> h.shape=(64,256,256)
+        h = self.pool.forward(h) # h.shape=(64,256,256) -> h.shape=(64,256)
         self.drop.training = training
-        h = self.drop.forward(h)
-        logits = self.out.forward(h)  # (B,1)
-        probs = sigmoid(logits)
+        h = self.drop.forward(h) # h.shape=(64,256) -> h.shape=(64,256)
+        logits = self.out.forward(h)  # (B,1), h.shape=(64,256) -> logits.shape=(64,1)
+        probs = sigmoid(logits) # logits.shape=(64,1) -> probs.shape=(64,1)
+        
         # Caches the outputs needed for loss calculation and backpropagation.
-        self._cache_logits = logits
-        self._cache_probs = probs
-        self._cache_labels = None
+        self._cache_probs = probs # probs.shape=(64,1)
         return probs
 
     def backward(self, y_true: np.ndarray):
         # Defines the backward pass.
         # Starts by computing the gradient of the loss with respect to the output logits.
         # The derivative of Binary Cross-Entropy (BCE) with respect to logits is `(probs - y_true)`.
-        probs = self._cache_probs.reshape(-1, 1)
-        y = y_true.reshape(-1, 1).astype(np.float32)
+        probs = self._cache_probs.reshape(-1, 1) # self._cache_probs.shape=(64,1) -> probs.shape=(64,1)
+        y = y_true.reshape(-1, 1).astype(np.float32) # y_true.shape=(64,) -> y.shape=(64,1) 
         # Average the gradient over the batch size.
-        dlogits = (probs - y) / y.shape[0]
+        dlogits = (probs - y) / y.shape[0] # dlogits.shape=(64,1)
         # Backpropagates the gradient through the layers in reverse order.
-        dh = self.out.backward(dlogits)
-        dh = self.drop.backward(dh)
-        dh = self.pool.backward(dh)
-        dh = self.encoder.backward(dh)
-        self.embed.backward(dh)
+        dh = self.out.backward(dlogits) # dlogits.shape=(64,1) -> dh.shape=(64,256)
+        dh = self.drop.backward(dh) # dh.shape=(64,256) -> dh.shape=(64,256)
+        dh = self.pool.backward(dh) # dh.shape=(64,256) -> dh.shape=(64,256)
+        dh = self.encoder.backward(dh) # dh.shape=(64,256) -> dh.shape=(64,256,256)
+        self.embed.backward(dh) # dh.shape=(64,256,256)
 
     def loss_and_acc(self, y_true: np.ndarray) -> Tuple[float, float]:
         # Calculates the Binary Cross-Entropy loss and accuracy.
-        probs = self._cache_probs.reshape(-1)
+        probs = self._cache_probs.reshape(-1) # probs.shape=(64,) -> (64,)
         y = y_true.astype(np.float32)
         eps = 1e-7
         # The BCE formula is `-mean(y * log(p) + (1-y) * log(1-p))`. `eps` is added for numerical stability.
-        bce = -np.mean(y * np.log(probs + eps) + (1 - y) * np.log(1 - probs + eps))
+        bce = -np.mean(y * np.log(probs + eps) + (1 - y) * np.log(1 - probs + eps)) #bce=0.6931471824645996
         # Accuracy is calculated by thresholding probabilities at 0.5.
-        preds = (probs >= 0.5).astype(np.int32)
-        acc = (preds == y_true).mean()
+        preds = (probs >= 0.5).astype(np.int32) # preds.shape=(64,)
+        acc = (preds == y_true).mean() #preds.shape=(64,) y_true.shape=(64,) -> acc=0.5
         return float(bce), float(acc)
-
 
 # ----------------------------
 # Optimizer: RMSprop
@@ -621,7 +617,6 @@ class RMSprop:
 # Training utilities
 # ----------------------------
 # Functions to manage the training and evaluation loops.
-
 def iterate_minibatches(X_ids: List[List[int]], y: np.ndarray, batch_size: int, maxlen: int, shuffle: bool = True):
     """
     A generator that yields batches of padded data for training or evaluation.
