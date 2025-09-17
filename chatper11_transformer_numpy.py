@@ -460,52 +460,52 @@ class TransformerEncoderBlock:
     - Includes residual connections (`x + h`) and dropout for regularization.
     """
     def __init__(self, dim: int, hidden: int, num_heads: int, dropout_p: float = 0.0, seed: int = 0):
-        self.ln1 = LayerNorm(dim)
-        self.attn = MultiHeadSelfAttention(dim, num_heads, seed=seed)
-        self.drop1 = Dropout(dropout_p, seed=seed + 11)
-        self.ln2 = LayerNorm(dim)
-        self.ff = FeedForward(dim, hidden, seed=seed + 20)
-        self.drop2 = Dropout(dropout_p, seed=seed + 21)
+        self.ln1 = LayerNorm(dim) # dim=256
+        self.attn = MultiHeadSelfAttention(dim, num_heads, seed=seed)  # dim=256, num_heads=2, seed=0
+        self.drop1 = Dropout(dropout_p, seed=seed + 11) #dropout_p=0.5, seed=11
+        self.ln2 = LayerNorm(dim) # dim=256
+        self.ff = FeedForward(dim, hidden, seed=seed + 20) # dim=256, hidden=32, seed=20
+        self.drop2 = Dropout(dropout_p, seed=seed + 21) #dropout_p=0.5, seed=21
 
     def forward(self, x: np.ndarray, training: bool = True) -> np.ndarray:
         self.drop1.training = training
         self.drop2.training = training
         # First sub-layer: Attention
-        h = self.ln1.forward(x)
-        h = self.attn.forward(h)
-        h = self.drop1.forward(h)
+        h = self.ln1.forward(x) # x.shape=(64,256,256) -> h.shape=(64,256,256)
+        h = self.attn.forward(h) # h.shape=(64,256,256) -> h.shape=(64,256,256)
+        h = self.drop1.forward(h) # h.shape=(64,256,256) -> h.shape=(64,256,256)
         # Residual connection
-        x = x + h
+        x = x + h # x.shape=(64,256,256) + h.shape=(64,256,256) -> x.shape=(64,256,256)
         # Second sub-layer: Feed-forward
-        h2 = self.ln2.forward(x)
-        h2 = self.ff.forward(h2)
-        h2 = self.drop2.forward(h2)
+        h2 = self.ln2.forward(x) # x.shape=(64,256,256) -> h2.shape=(64,256,256)
+        h2 = self.ff.forward(h2) # h2.shape=(64,256,256) -> h2.shape=(64,256,256)
+        h2 = self.drop2.forward(h2) # h2.shape=(64,256,256) -> h2.shape=(64,256,256)
         # Residual connection
-        out = x + h2
+        out = x + h2 # x.shape=(64,256,256) + h2.shape=(64,256,256) -> out.shape=(64,256,256)
         return out
 
     def backward(self, dout: np.ndarray) -> np.ndarray:
         # The backward pass follows the forward pass in reverse, handling residual gradients.
         # Gradient flows back through the second residual connection.
-        dh2 = dout
-        dh2 = self.drop2.backward(dh2)
-        dh2 = self.ff.backward(dh2)
-        dx2 = self.ln2.backward(dh2)
+        dh2 = dout # dout.shape=(64,256,256)
+        dh2 = self.drop2.backward(dh2) # dh2.shape=(64,256,256) -> dh2.shape=(64,256,256)
+        dh2 = self.ff.backward(dh2) # dh2.shape=(64,256,256) -> dh2.shape=(64,256,256)
+        dh2 = self.ln2.backward(dh2) # dh2.shape=(64,256,256) -> dx2.shape=(64,256,256)
         # Gradient for the input of the second residual is the sum of `dout` and `dx2`.
-        dx = dout + dx2
+        #dx = dout + dx2
 
         # Gradient flows back through the first residual connection.
-        dh1 = dx
+        dh1 = dout + dh2
         dh1 = self.drop1.backward(dh1)
         dh1 = self.attn.backward(dh1)
-        dx1 = self.ln1.backward(dh1)
+        dh1 = self.ln1.backward(dh1)
         # The final gradient is the sum of the gradient from the first residual path (`dx1`)
         # and the gradient that "skipped" the first residual connection (`dout`). This seems
         # to be a slight error in the residual gradient calculation. The correct form for
         # `x = x + h` would be `dx = dout`, and `dh = dout`. So, `dx_total = dx1 + dout`.
         # This implementation calculates `dx` and then re-adds `dout`, which is redundant.
-        dx_total = dx1 + dout
-        return dx_total
+        #dx_total = dx1 + dout # dx1.shape=(64,256,256) + dout.shape=(64,256,256) -> dx_total.shape=(64,256,256)
+        return dh1+dout
 
     @property
     def params(self):
