@@ -335,12 +335,12 @@ class MultiHeadSelfAttention:
     
     """
     def __init__(self, dim: int, num_heads: int, seed: int = 0):
-        assert dim % num_heads == 0
-        self.dim = dim
-        self.num_heads = num_heads
-        self.head_dim = dim // num_heads
+        assert dim % num_heads == 0 # dim=256, num_heads=2
+        self.dim = dim # 256
+        self.num_heads = num_heads # 2
+        self.head_dim = dim // num_heads # 128
         # Defines the dense layers for Query, Key, and Value projections.
-        self.Wq = Dense(dim, dim, name_prefix="attn/Wq", seed=seed)
+        self.Wq = Dense(dim, dim, name_prefix="attn/Wq", seed=seed) # dim=256, dim=256, seed=0
         self.Wk = Dense(dim, dim, name_prefix="attn/Wk", seed=seed + 1)
         self.Wv = Dense(dim, dim, name_prefix="attn/Wv", seed=seed + 2)
         # The final output projection layer.
@@ -350,9 +350,9 @@ class MultiHeadSelfAttention:
     def _split_heads(self, x: np.ndarray) -> np.ndarray:
         # Reshapes the input tensor to separate the heads.
         # (B, T, D) -> (B, H, T, Hd)
-        B, T, D = x.shape
-        x = x.reshape(B, T, self.num_heads, self.head_dim)
-        return x.transpose(0, 2, 1, 3)
+        B, T, D = x.shape # x.shape=(64, 256, 256)
+        x = x.reshape(B, T, self.num_heads, self.head_dim) # x.shape=(64, 256, 2, 128)
+        return x.transpose(0, 2, 1, 3) # x.shape=(64, 2, 256, 128)
 
     def _merge_heads(self, x: np.ndarray) -> np.ndarray:
         # Merges the outputs from the multiple heads back into a single tensor.
@@ -363,56 +363,56 @@ class MultiHeadSelfAttention:
 
     def forward(self, x: np.ndarray) -> np.ndarray:
         # Project input to Q, K, V and split heads.
-        Q = self._split_heads(self.Wq.forward(x))
-        K = self._split_heads(self.Wk.forward(x))
+        Q = self._split_heads(self.Wq.forward(x)) # x.shape= (64, 256, 256) -> Q.shape=(64, 2, 256, 128)
+        K = self._split_heads(self.Wk.forward(x)) 
         V = self._split_heads(self.Wv.forward(x))
         # Scaled dot-product attention formula: `softmax(Q @ K.T / sqrt(d_k)) @ V`.
-        scale = 1.0 / math.sqrt(self.head_dim)
-        scores = (Q @ K.transpose(0, 1, 3, 2)) * scale
+        scale = 1.0 / math.sqrt(self.head_dim) # head_dim=128
+        scores = (Q @ K.transpose(0, 1, 3, 2)) * scale # Q.shape=(64, 2, 256, 128) @ K.T.shape=(64, 2, 128, 256) -> scores.shape=(64, 2, 256, 256)
         # Softmax on scores to get attention weights.
-        scores_max = scores.max(axis=-1, keepdims=True)
-        exp_scores = np.exp(scores - scores_max)
-        attn = exp_scores / exp_scores.sum(axis=-1, keepdims=True)
-        out_heads = attn @ V
+        scores_max = scores.max(axis=-1, keepdims=True) # scores_max.shape=(64, 2, 256, 1)
+        exp_scores = np.exp(scores - scores_max) # exp_scores.shape=(64, 2, 256, 256)
+        attn = exp_scores / exp_scores.sum(axis=-1, keepdims=True) # exp_scores.sum(axis=-1, keepdims=True).shape=(64, 2, 256, 1), attn.shape=(64, 2, 256, 256)
+        out_heads = attn @ V # attn.shape=(64, 2, 256, 256) @ V.shape=(64, 2, 256, 128) -> out_heads.shape=(64, 2, 256, 128)
         # Merge heads and pass through the final linear layer.
-        out = self._merge_heads(out_heads)
-        out = self.Wo.forward(out)
+        out = self._merge_heads(out_heads) # out_heads.shape=(64, 2, 256, 128) -> out.shape=(64, 256, 256)
+        out = self.Wo.forward(out) # out.shape=(64, 256, 256) -> out.shape=(64, 256, 256)
         self.cache = (x, Q, K, V, attn, out_heads)
         return out
 
     def backward(self, dout: np.ndarray) -> np.ndarray:
-        x, Q, K, V, attn, out_heads = self.cache
+        x, Q, K, V, attn, out_heads = self.cache # x.shape=(64, 256, 256), Q.shape=(64, 2, 256, 128), K.shape=(64, 2, 256, 128), V.shape=(64, 2, 256, 128), attn.shape=(64, 2, 256, 256), out_heads.shape=(64, 2, 256, 128)
         # The backward pass is a complex reverse of the forward pass, applying the chain rule
         # to each operation, from the final output back to the input.
-        dmerge = self.Wo.backward(dout)
-        B, T, D = dmerge.shape
-        dheads = dmerge.reshape(B, T, self.num_heads, self.head_dim).transpose(0, 2, 1, 3)
-        dattn = dheads @ V.transpose(0, 1, 3, 2)
-        dV = attn.transpose(0, 1, 3, 2) @ dheads
+        dmerge = self.Wo.backward(dout) # dout.shape=(64, 256, 256) -> dmerge.shape=(64, 256, 256)
+        B, T, D = dmerge.shape # dmerge.shape=(64, 256, 256)
+        dheads = dmerge.reshape(B, T, self.num_heads, self.head_dim).transpose(0, 2, 1, 3) # dheads.shape=(64, 2, 256, 128)
+        dattn = dheads @ V.transpose(0, 1, 3, 2) # dheads.shape=(64, 2, 256, 128) @ V.T.shape=(64, 2, 128, 256) -> dattn.shape=(64, 2, 256, 256)
+        dV = attn.transpose(0, 1, 3, 2) @ dheads # attn.T.shape=(64, 2, 256, 256) @ dheads.shape=(64, 2, 256, 128) -> dV.shape=(64, 2, 256, 128)
         # Manually computes the backward pass for the softmax function.
-        dscores = np.empty_like(attn)
+        dscores = np.empty_like(attn) # dscores.shape=(64, 2, 256, 256)
         for b in range(B):
             for h in range(self.num_heads):
-                A = attn[b, h]
-                dA = dattn[b, h]
-                s = (dA * A).sum(axis=-1, keepdims=True)
-                dscores[b, h] = A * (dA - s)
-        scale = 1.0 / math.sqrt(self.head_dim)
-        dscores *= scale
-        dQ = dscores @ K
-        dK = dscores.transpose(0, 1, 3, 2) @ Q
+                A = attn[b, h] # A.shape=(256, 256)
+                dA = dattn[b, h] # dA.shape=(256, 256)
+                s = (dA * A).sum(axis=-1, keepdims=True) # s.shape=(256, 1)
+                dscores[b, h] = A * (dA - s) # dscores.shape=(64, 2, 256, 256)
+        scale = 1.0 / math.sqrt(self.head_dim) # head_dim=128
+        dscores *= scale # dscores.shape=(64, 2, 256, 256)
+        dQ = dscores @ K # dscores.shape=(64, 2, 256, 256) @ K.shape=(64, 2, 256, 128) -> dQ.shape=(64, 2, 256, 128)
+        dK = dscores.transpose(0, 1, 3, 2) @ Q # dscores.T.shape=(64, 2, 256, 256) @ Q.shape=(64, 2, 256, 128) -> dK.shape=(64, 2, 256, 128)
         # Merge head gradients and backpropagate through the initial Dense layers.
         def merge(xh):
-            return xh.transpose(0, 2, 1, 3).reshape(B, T, D)
-        dQm = merge(dQ)
+            return xh.transpose(0, 2, 1, 3).reshape(B, T, D) # xh.shape=(64, 2, 256, 128) -> out.shape=(64, 256, 256)
+        dQm = merge(dQ) # dQ.shape=(64, 2, 256, 128) -> dQm.shape=(64, 256, 256)
         dKm = merge(dK)
         dVm = merge(dV)
-        dx_q = self.Wq.backward(dQm)
+        dx_q = self.Wq.backward(dQm) # dQm.shape=(64, 256, 256) -> dx_q.shape=(64, 256, 256)
         dx_k = self.Wk.backward(dKm)
         dx_v = self.Wv.backward(dVm)
         # Sum the gradients from Q, K, and V paths to get the total input gradient.
-        dx = dx_q + dx_k + dx_v
-        return dx
+        dx = dx_q + dx_k + dx_v # dx_q.shape=(64, 256, 256) + dx_k.shape=(64, 256, 256) + dx_v.shape=(64, 256, 256) -> dx.shape=(64, 256, 256)
+        return dx # dx.shape=(64, 256, 256)
 
     @property
     def params(self):
