@@ -1,116 +1,628 @@
 # dataset: http://storage.googleapis.com/download.tensorflow.org/data/spa-eng.zip
-"""
-NumPy-only Transformer (Encoder–Decoder) for English→Spanish toy translation
-- No TensorFlow / Keras
-- Greedy decoding
-- Teacher forcing during training
-- Batches built from spa-eng/spa.txt (same dataset path as your script)
-
-NOTE: This is a compact educational implementation meant to run on CPU.
-Expect training to be slow compared to framework equivalents; start with a few
-steps/epochs just to verify correctness, then expand.
-"""
 import os
 import re
 import math
+import json
 import random
-import string
-from typing import List, Tuple, Dict
-import time, math
+from collections import Counter
+from typing import List, Tuple, Dict, Any
+import time
+
 import numpy as np
 
-# ---------------------------
-# Data prep / tokenization
-# ---------------------------
-DATA_PATH = "spa-eng/spa.txt"  # same as your script
-vocab_size = 15000
-sequence_length = 20  # source len; target uses +1 for start/end handling
-batch_size = 64
-seed = 0
-rng = np.random.default_rng(seed)
+# =============================================================
+# Data utilities (spa-eng)
+# =============================================================
 
-strip_chars = string.punctuation + "¿"
-strip_chars = strip_chars.replace("[", "").replace("]", "")
-
-# Special tokens / ids
-PAD = "[pad]"
-START = "[start]"
-END = "[end]"
-UNK = "[unk]"
-
-# indices
-PAD_ID = 0
-START_ID = 1
-END_ID = 2
-UNK_ID = 3
-
-SPECIALS = [PAD, START, END, UNK]
+SPECIAL_TOKENS = {
+    "<PAD>": 0,
+    "<OOV>": 1,
+    "[start]": 2,
+    "[end]": 3,
+}
 
 
-def load_pairs(path: str) -> List[Tuple[str, str]]:
-    with open(path, encoding="utf-8") as f:
-        lines = f.read().splitlines()
+def clean_text_en(t: str) -> str:
+    t = t.lower()
+    t = re.sub(r"<.*?>", " ", t)
+    t = re.sub(r"[^a-z0-9' ]+", " ", t)
+    t = re.sub(r"\s+", " ", t).strip()
+    return t
+
+
+def clean_text_es(t: str) -> str:
+    t = t.lower()
+    # keep accented letters and ñ, ¿, ¡
+    t = re.sub(r"<.*?>", " ", t)
+    t = re.sub(r"[^a-z0-9áéíóúüñ¿¡' ]+", " ", t)
+    t = re.sub(r"\s+", " ", t).strip()
+    return t
+
+
+def build_vocab(texts: List[str], vocab_size: int, is_target: bool = False) -> Dict[str, int]:
+    counter = Counter()
+    for t in texts:
+        ct = clean_text_es(t) if is_target else clean_text_en(t)
+        counter.update(ct.split())
+    # reserve special ids
+    base = list(SPECIAL_TOKENS.keys())
+    most_common = [w for w, _ in counter.most_common(max(0, vocab_size - len(base)))]
+    stoi = {tok: idx for tok, idx in SPECIAL_TOKENS.items()}
+    for i, w in enumerate(most_common, start=len(SPECIAL_TOKENS)):
+        if w not in stoi:
+            stoi[w] = i
+    return stoi
+
+
+def encode(text: str, stoi: Dict[str, int], is_target: bool = False) -> List[int]:
+    t = clean_text_es(text) if is_target else clean_text_en(text)
+    return [stoi.get(w, SPECIAL_TOKENS["<OOV>"]) for w in t.split()]
+
+
+def pad_batch(batch: List[List[int]], maxlen: int) -> np.ndarray:
+    x = np.zeros((len(batch), maxlen), dtype=np.int64)
+    for i, seq in enumerate(batch):
+        seq = seq[:maxlen]
+        x[i, : len(seq)] = np.array(seq, dtype=np.int64)
+    return x
+
+
+def load_spa_eng(path: str) -> List[Tuple[str, str]]:
+    """path points to folder containing spa.txt (unzipped spa-eng.zip)."""
+    txt = os.path.join(path, "spa.txt")
     pairs = []
-    for line in lines:
-        if not line:
-            continue
-        en, es, *_ = line.split("\t")
-        es = f"{START} {es} {END}"
-        pairs.append((en, es))
+    with open(txt, encoding="utf-8") as f:
+        for line in f:
+            line = line.rstrip("\n")
+            if not line:
+                continue
+            eng, spa, *_ = line.split("\t")
+            pairs.append((eng, spa))
     return pairs
 
 
-def standardize_target(s: str) -> str:
-    s = s.lower()
-    return re.sub(f"[{re.escape(strip_chars)}]", "", s)
+# =============================================================
+# Core autograd-lite tensors (Parameters only)
+# =============================================================
+
+class Parameter:
+    def __init__(self, value: np.ndarray, name: str = ""):
+        self.value = value
+        self.grad = np.zeros_like(value)
+        self.name = name
+
+    def zero_grad(self):
+        self.grad[...] = 0.0
 
 
-def simple_tokenize(text: str) -> List[str]:
-    return text.strip().split()
+# =============================================================
+# Layers
+# =============================================================
+
+class Embedding:
+    def __init__(self, vocab_size: int, embed_dim: int, seed: int = 0, name: str = "emb"):
+        rng = np.random.default_rng(seed)
+        W = rng.normal(0, 0.02, size=(vocab_size, embed_dim)).astype(np.float32)
+        self.W = Parameter(W, f"{name}/W")
+        self.cache_ids = None
+
+    def forward(self, x_ids: np.ndarray) -> np.ndarray:
+        out = self.W.value[x_ids]
+        self.cache_ids = x_ids
+        return out
+
+    def backward(self, dout: np.ndarray):
+        np.add.at(self.W.grad, self.cache_ids, dout)
+
+    @property
+    def params(self):
+        return [self.W]
 
 
-def build_vocab(texts: List[str], max_tokens: int, standardize=None) -> Tuple[Dict[str, int], List[str]]:
-    freq = {}
-    for t in texts:
-        if standardize:
-            t = standardize(t)
-        for tok in simple_tokenize(t):
-            freq[tok] = freq.get(tok, 0) + 1
-    # sort by frequency desc, then lexicographically
-    items = sorted(freq.items(), key=lambda kv: (-kv[1], kv[0]))
-    vocab = SPECIALS.copy()
-    for tok, _ in items:
-        if tok in (START, END):
-            # START/END already ensured in target strings
-            continue
-        if len(vocab) >= max_tokens:
-            break
-        vocab.append(tok)
-    itos = vocab
-    stoi = {tok: i for i, tok in enumerate(itos)}
-    return stoi, itos
+class LayerNorm:
+    def __init__(self, dim: int, eps: float = 1e-5, name: str = "ln"):
+        self.gamma = Parameter(np.ones((dim,), dtype=np.float32), f"{name}/gamma")
+        self.beta = Parameter(np.zeros((dim,), dtype=np.float32), f"{name}/beta")
+        self.eps = eps
+        self.cache = None
+
+    def forward(self, x: np.ndarray) -> np.ndarray:
+        mean = x.mean(axis=-1, keepdims=True)
+        var = x.var(axis=-1, keepdims=True)
+        xhat = (x - mean) / np.sqrt(var + self.eps)
+        out = self.gamma.value * xhat + self.beta.value
+        self.cache = (xhat, var, x)
+        return out
+
+    def backward(self, dout: np.ndarray) -> np.ndarray:
+        xhat, var, x = self.cache
+        N = x.shape[-1]
+        reduce_axes = tuple(range(dout.ndim - 1))
+        self.gamma.grad += (dout * xhat).sum(axis=reduce_axes)
+        self.beta.grad += dout.sum(axis=reduce_axes)
+        std_inv = 1.0 / np.sqrt(var + self.eps)
+        dxhat = dout * self.gamma.value
+        dx = (1.0 / N) * std_inv * (
+            N * dxhat - dxhat.sum(axis=-1, keepdims=True)
+            - xhat * (dxhat * xhat).sum(axis=-1, keepdims=True)
+        )
+        return dx
+
+    @property
+    def params(self):
+        return [self.gamma, self.beta]
 
 
-def vectorize(texts: List[str], stoi: Dict[str, int], seq_len: int, standardize=None) -> np.ndarray:
-    out = np.full((len(texts), seq_len), PAD_ID, dtype=np.int64)
-    for i, t in enumerate(texts):
-        if standardize:
-            t = standardize(t)
-        toks = simple_tokenize(t)
-        toks = toks[:seq_len]
-        ids = [stoi.get(tok, UNK_ID) for tok in toks]
-        out[i, :len(ids)] = np.array(ids, dtype=np.int64)
+class Dropout:
+    def __init__(self, p: float, seed: int = 0):
+        self.p = p
+        self.rng = np.random.default_rng(seed)
+        self.mask = None
+        self.training = True
+
+    def forward(self, x: np.ndarray) -> np.ndarray:
+        if not self.training or self.p <= 0:
+            self.mask = None
+            return x
+        self.mask = (self.rng.uniform(size=x.shape) >= self.p).astype(np.float32)
+        return x * self.mask / (1.0 - self.p)
+
+    def backward(self, dout: np.ndarray) -> np.ndarray:
+        if self.mask is None:
+            return dout
+        return dout * self.mask / (1.0 - self.p)
+
+    @property
+    def params(self):
+        return []
+
+
+class Dense:
+    def __init__(self, in_dim: int, out_dim: int, bias: bool = True, seed: int = 0, name: str = "dense"):
+        rng = np.random.default_rng(seed)
+        limit = math.sqrt(6 / (in_dim + out_dim))
+        self.W = Parameter(rng.uniform(-limit, limit, size=(in_dim, out_dim)).astype(np.float32), f"{name}/W")
+        self.b = Parameter(np.zeros((out_dim,), dtype=np.float32), f"{name}/b") if bias else None
+        self.cache = None
+
+    def forward(self, x: np.ndarray) -> np.ndarray:
+        out = x @ self.W.value
+        if self.b is not None:
+            out = out + self.b.value
+        self.cache = x
+        return out
+
+    def backward(self, dout: np.ndarray) -> np.ndarray:
+        x = self.cache
+        self.W.grad += x.reshape(-1, x.shape[-1]).T @ dout.reshape(-1, dout.shape[-1])
+        if self.b is not None:
+            self.b.grad += dout.sum(axis=tuple(range(dout.ndim - 1)))
+        dx = dout @ self.W.value.T
+        return dx
+
+    @property
+    def params(self):
+        return [p for p in [self.W, self.b] if p is not None]
+
+
+def relu(x: np.ndarray) -> np.ndarray:
+    return np.maximum(x, 0.0)
+
+
+def drelu(x: np.ndarray) -> np.ndarray:
+    return (x > 0).astype(np.float32)
+
+
+class FeedForward:
+    def __init__(self, dim: int, hidden: int, seed: int = 0, name: str = "ff"):
+        self.lin1 = Dense(dim, hidden, name=f"{name}/lin1", seed=seed)
+        self.lin2 = Dense(hidden, dim, name=f"{name}/lin2", seed=seed + 1)
+        self.cache_a = None
+
+    def forward(self, x: np.ndarray) -> np.ndarray:
+        a = self.lin1.forward(x)
+        h = relu(a)
+        self.cache_a = a
+        out = self.lin2.forward(h)
+        return out
+
+    def backward(self, dout: np.ndarray) -> np.ndarray:
+        dh = self.lin2.backward(dout)
+        da = dh * drelu(self.cache_a)
+        dx = self.lin1.backward(da)
+        return dx
+
+    @property
+    def params(self):
+        return self.lin1.params + self.lin2.params
+
+
+# --------- Attention (general: can do self- or cross-attn) ---------
+
+class MultiHeadAttention:
+    def __init__(self, dim_q: int, dim_kv: int, num_heads: int, seed: int = 0, name: str = "attn"):
+        assert dim_q % num_heads == 0
+        assert dim_kv % num_heads == 0
+        self.num_heads = num_heads
+        self.head_q = dim_q // num_heads
+        self.head_kv = dim_kv // num_heads
+        self.Wq = Dense(dim_q, dim_q, name=f"{name}/Wq", seed=seed)
+        self.Wk = Dense(dim_kv, dim_kv, name=f"{name}/Wk", seed=seed + 1)
+        self.Wv = Dense(dim_kv, dim_kv, name=f"{name}/Wv", seed=seed + 2)
+        self.Wo = Dense(dim_q, dim_q, name=f"{name}/Wo", seed=seed + 3)
+        self.cache = None
+
+    def _split(self, x: np.ndarray, dim_per_head: int) -> np.ndarray:
+        B, T, D = x.shape
+        x = x.reshape(B, T, self.num_heads, dim_per_head)
+        return x.transpose(0, 2, 1, 3)  # (B,H,T,Hd)
+
+    def _merge(self, x: np.ndarray) -> np.ndarray:
+        B, H, T, Hd = x.shape
+        return x.transpose(0, 2, 1, 3).reshape(B, T, H * Hd)
+
+    def forward(self, q: np.ndarray, k: np.ndarray, v: np.ndarray,
+                mask: np.ndarray = None) -> np.ndarray:
+        # q,k,v: (B,T*,D)
+        Q = self._split(self.Wq.forward(q), self.head_q)
+        K = self._split(self.Wk.forward(k), self.head_kv)
+        V = self._split(self.Wv.forward(v), self.head_kv)
+        scale = 1.0 / math.sqrt(self.head_kv)
+        scores = (Q @ K.transpose(0, 1, 3, 2)) * scale  # (B,H,Tq,Tk)
+        if mask is not None:
+            # mask: True means masked. Broadcast to (B,1,Tq,Tk)
+            scores = np.where(mask, -1e9, scores)
+        # softmax last axis
+        scores_max = scores.max(axis=-1, keepdims=True)
+        exp_scores = np.exp(scores - scores_max)
+        denom = exp_scores.sum(axis=-1, keepdims=True) + 1e-12
+        A = exp_scores / denom  # (B,H,Tq,Tk)
+        out_h = A @ V  # (B,H,Tq,Hd)
+        out = self._merge(out_h)  # (B,Tq,D)
+        out = self.Wo.forward(out)
+        self.cache = (q, k, v, Q, K, V, A, out_h, mask)
+        return out
+
+    def backward(self, dout: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        q, k, v, Q, K, V, A, out_h, mask = self.cache
+        dmerge = self.Wo.backward(dout)  # (B,Tq,D)
+        B, Tq, D = dmerge.shape
+        H = self.num_heads
+        Hd = D // H
+        dh = dmerge.reshape(B, Tq, H, Hd).transpose(0, 2, 1, 3)  # (B,H,Tq,Hd)
+        # A @ V = out_h
+        dA = dh @ V.transpose(0, 1, 3, 2)   # (B,H,Tq,Tk)
+        dV = A.transpose(0, 1, 3, 2) @ dh   # (B,H,Tk,Hd)
+        # softmax backward per row
+        dS = np.empty_like(A)
+        for b in range(B):
+            for h in range(H):
+                for t in range(Tq):
+                    a = A[b, h, t]               # (Tk,)
+                    da = dA[b, h, t]
+                    s = (da * a).sum()
+                    dS[b, h, t] = a * (da - s)
+        # scale
+        dS *= 1.0 / math.sqrt(Hd)
+        # S = Q @ K^T
+        dQ = dS @ K
+        dK = dS.transpose(0, 1, 3, 2) @ Q
+        # merge heads back
+        def merge(xh):
+            return xh.transpose(0, 2, 1, 3).reshape(B, Tq if xh.shape[2] == Tq else xh.shape[2], H * Hd)
+        dQm = merge(dQ)  # (B,Tq,D)
+        dKm = merge(dK)  # (B,Tk,D)
+        dVm = merge(dV)  # (B,Tk,D)
+        dq = self.Wq.backward(dQm)
+        dk = self.Wk.backward(dKm)
+        dv = self.Wv.backward(dVm)
+        return dq, dk, dv
+
+    @property
+    def params(self):
+        return self.Wq.params + self.Wk.params + self.Wv.params + self.Wo.params
+
+
+# --------- Encoder / Decoder blocks ---------
+
+class TransformerEncoderBlock:
+    def __init__(self, dim: int, hidden: int, num_heads: int, dropout_p: float = 0.1, seed: int = 0, name: str = "encblk"):
+        self.ln1 = LayerNorm(dim, name=f"{name}/ln1")
+        self.attn = MultiHeadAttention(dim, dim, num_heads, seed=seed, name=f"{name}/attn")
+        self.drop1 = Dropout(dropout_p, seed=seed + 11)
+        self.ln2 = LayerNorm(dim, name=f"{name}/ln2")
+        self.ff = FeedForward(dim, hidden, seed=seed + 20, name=f"{name}/ff")
+        self.drop2 = Dropout(dropout_p, seed=seed + 21)
+
+    def forward(self, x: np.ndarray, training: bool, src_pad: np.ndarray) -> np.ndarray:
+        self.drop1.training = training
+        self.drop2.training = training
+        h = self.ln1.forward(x)
+        # mask keys only: broadcast to (B,1,Tq,Tk) with Tq=Tk
+        B, T, _ = x.shape
+        key_mask = src_pad[:, None, None, :]  # (B,1,1,T)
+        h = self.attn.forward(h, h, h, mask=key_mask)
+        h = self.drop1.forward(h)
+        x = x + h
+        h2 = self.ln2.forward(x)
+        h2 = self.ff.forward(h2)
+        h2 = self.drop2.forward(h2)
+        out = x + h2
+        return out
+
+    def backward(self, dout: np.ndarray) -> np.ndarray:
+        dh2 = self.drop2.backward(dout)
+        dh2 = self.ff.backward(dh2)
+        dx2 = self.ln2.backward(dh2)
+        dx = dout + dx2
+        dh1 = self.drop1.backward(dx)
+        dq, dk, dv = self.attn.backward(dh1)
+        dx1 = self.ln1.backward(dq)  # attn is pre-norm; gradient path via q only
+        # residual: add gradient that flowed around attn (dx)
+        return dx1 + dx
+
+    @property
+    def params(self):
+        return self.ln1.params + self.attn.params + self.ln2.params + self.ff.params
+
+
+class TransformerDecoderBlock:
+    def __init__(self, dim: int, hidden: int, num_heads: int, dropout_p: float = 0.1, seed: int = 0, name: str = "decblk"):
+        self.ln1 = LayerNorm(dim, name=f"{name}/ln1")
+        self.self_attn = MultiHeadAttention(dim, dim, num_heads, seed=seed, name=f"{name}/self")
+        self.drop1 = Dropout(dropout_p, seed=seed + 11)
+        self.ln2 = LayerNorm(dim, name=f"{name}/ln2")
+        self.cross_attn = MultiHeadAttention(dim, dim, num_heads, seed=seed + 1, name=f"{name}/cross")
+        self.drop2 = Dropout(dropout_p, seed=seed + 21)
+        self.ln3 = LayerNorm(dim, name=f"{name}/ln3")
+        self.ff = FeedForward(dim, hidden, seed=seed + 31, name=f"{name}/ff")
+        self.drop3 = Dropout(dropout_p, seed=seed + 41)
+        self._cache_shapes = None
+
+    @staticmethod
+    def build_causal_mask(B: int, T: int) -> np.ndarray:
+        causal = np.triu(np.ones((T, T), dtype=bool), k=1)  # True above diagonal -> masked
+        return np.broadcast_to(causal, (B, 1, T, T))
+
+    def forward(self, y: np.ndarray, enc_out: np.ndarray, training: bool, dec_pad: np.ndarray, enc_pad: np.ndarray) -> np.ndarray:
+        self.drop1.training = training
+        self.drop2.training = training
+        self.drop3.training = training
+        B, T, _ = y.shape
+        # Self-attention with causal + key padding
+        h = self.ln1.forward(y)
+        self_mask = self.build_causal_mask(B, T) | dec_pad[:, None, None, :]  # (B,1,T,T)
+        h = self.self_attn.forward(h, h, h, mask=self_mask)
+        h = self.drop1.forward(h)
+        y = y + h
+        # Cross-attention (mask keys using encoder padding)
+        h2 = self.ln2.forward(y)
+        cross_mask = enc_pad[:, None, None, :]  # (B,1,Tq,Tk) with Tq=T_dec, Tk=T_src
+        h2 = self.cross_attn.forward(h2, enc_out, enc_out, mask=cross_mask)
+        h2 = self.drop2.forward(h2)
+        y = y + h2
+        h3 = self.ln3.forward(y)
+        h3 = self.ff.forward(h3)
+        h3 = self.drop3.forward(h3)
+        out = y + h3
+        # cache for backprop tie-ups
+        self._cache_shapes = (self_mask, cross_mask)
+        return out
+
+    def backward(self, dout: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        # returns gradients wrt decoder input and encoder output (to route upstream)
+        dh3 = self.drop3.backward(dout)
+        dh3 = self.ff.backward(dh3)
+        dy3 = self.ln3.backward(dh3)
+        dy = dout + dy3
+        dh2 = self.drop2.backward(dy)
+        dq_cross, dk_cross, dv_cross = self.cross_attn.backward(dh2)
+        dy2 = self.ln2.backward(dq_cross)
+        dy = dy + dy2
+        dh1 = self.drop1.backward(dy)
+        dq_self, dk_self, dv_self = self.self_attn.backward(dh1)
+        dy1 = self.ln1.backward(dq_self)
+        dy_total = dy1 + dy
+        # encoder receives dk_cross + dv_cross via its output (k,v are projections of enc_out)
+        denc = dk_cross + dv_cross
+        return dy_total, denc
+
+    @property
+    def params(self):
+        return (
+            self.ln1.params + self.self_attn.params +
+            self.ln2.params + self.cross_attn.params +
+            self.ln3.params + self.ff.params
+        )
+
+
+# =============================================================
+# Full Seq2Seq Transformer
+# =============================================================
+
+class Seq2SeqTransformer:
+    def __init__(self, src_vocab: int, tgt_vocab: int, embed_dim: int = 256, num_heads: int = 8, ff_hidden: int = 1024,
+                 num_enc_layers: int = 1, num_dec_layers: int = 1, dropout_p: float = 0.1, max_len: int = 128, seed: int = 0):
+        self.embed_src = Embedding(src_vocab, embed_dim, seed=seed, name="src_emb")
+        self.embed_tgt = Embedding(tgt_vocab, embed_dim, seed=seed + 1, name="tgt_emb")
+        rng = np.random.default_rng(seed + 7)
+        self.pos_src = Parameter(rng.normal(0, 0.02, size=(max_len, embed_dim)).astype(np.float32), "pos/src")
+        self.pos_tgt = Parameter(rng.normal(0, 0.02, size=(max_len, embed_dim)).astype(np.float32), "pos/tgt")
+        self.enc_layers = [
+            TransformerEncoderBlock(embed_dim, ff_hidden, num_heads, dropout_p=dropout_p, seed=seed + i * 100, name=f"enc{i}")
+            for i in range(num_enc_layers)
+        ]
+        self.dec_layers = [
+            TransformerDecoderBlock(embed_dim, ff_hidden, num_heads, dropout_p=dropout_p, seed=seed + 1000 + i * 100, name=f"dec{i}")
+            for i in range(num_dec_layers)
+        ]
+        self.proj = Dense(embed_dim, tgt_vocab, name="proj", seed=seed + 9999)
+        self.dropout = Dropout(dropout_p, seed=seed + 4242)
+        self.max_len = max_len
+        self.training = True
+        # caches for backward across layer stacks
+        self._cache_enc_inputs = None
+        self._cache_dec_inputs = None
+
+    @property
+    def params(self):
+        ps = []
+        for m in [self.embed_src, self.embed_tgt, *self.enc_layers, *self.dec_layers, self.proj]:
+            ps += m.params if hasattr(m, 'params') else []
+        ps += [self.pos_src, self.pos_tgt]
+        return ps
+
+    def zero_grad(self):
+        for p in self.params:
+            p.zero_grad()
+
+    def forward(self, src_ids: np.ndarray, tgt_in_ids: np.ndarray, training: bool = True) -> np.ndarray:
+        self.training = training
+        B, Ts = src_ids.shape
+        _, Tt = tgt_in_ids.shape
+        # Embeddings + positions
+        hs = self.embed_src.forward(src_ids) + self.pos_src.value[:Ts][None, :, :]
+        ht = self.embed_tgt.forward(tgt_in_ids) + self.pos_tgt.value[:Tt][None, :, :]
+        # masks
+        src_pad = (src_ids == SPECIAL_TOKENS["<PAD>"])
+        tgt_pad = (tgt_in_ids == SPECIAL_TOKENS["<PAD>"])
+        # Encoder
+        for layer in self.enc_layers:
+            hs = layer.forward(hs, training=training, src_pad=src_pad)
+        # Decoder
+        for layer in self.dec_layers:
+            ht = layer.forward(ht, enc_out=hs, training=training, dec_pad=tgt_pad, enc_pad=src_pad)
+        # Final proj to vocab (apply dropout on decoder outputs)
+        self.dropout.training = training
+        h = self.dropout.forward(ht)
+        logits = self.proj.forward(h)  # (B,Tt,V)
+        # cache for backward routing
+        self._cache_enc_inputs = (src_pad,)
+        self._cache_dec_inputs = (tgt_pad,)
+        return logits
+
+    def backward(self, dlogits: np.ndarray):
+        # dlogits: (B,T,V)
+        dh = self.proj.backward(dlogits)
+        dh = self.dropout.backward(dh)
+        # back through decoder stack
+        denc_accum = 0
+        for layer in reversed(self.dec_layers):
+            dh, denc = layer.backward(dh)
+            denc_accum = denc_accum + denc
+        # back through encoder stack (propagate denc_accum)
+        grad = denc_accum
+        for layer in reversed(self.enc_layers):
+            grad = layer.backward(grad)
+        # back into embeddings
+        self.embed_tgt.backward(dh)
+        self.embed_src.backward(grad)
+
+    # ------------- Loss / metrics -------------
+
+    @staticmethod
+    def softmax(logits: np.ndarray) -> np.ndarray:
+        m = logits.max(axis=-1, keepdims=True)
+        e = np.exp(logits - m)
+        return e / (e.sum(axis=-1, keepdims=True) + 1e-12)
+
+    def loss_and_acc(self, logits: np.ndarray, tgt_out_ids: np.ndarray, pad_id: int = 0) -> Tuple[float, float, np.ndarray]:
+        # logits: (B,T,V) ; tgt_out_ids: (B,T)
+        probs = self.softmax(logits)
+        B, T, V = probs.shape
+        onehot = np.zeros_like(probs)
+        # mask out-of-range ids
+        tgt = np.clip(tgt_out_ids, 0, V - 1)
+        onehot[np.arange(B)[:, None], np.arange(T)[None, :], tgt] = 1.0
+        # cross-entropy with mask
+        pad_mask = (tgt_out_ids == pad_id)
+        # avoid log(0)
+        logp = np.log(probs + 1e-12)
+        nll = - (onehot * logp).sum(axis=-1)  # (B,T)
+        n_tokens = np.maximum(1, (~pad_mask).sum())
+        loss = float(nll[~pad_mask].sum() / n_tokens)
+        # accuracy
+        preds = probs.argmax(axis=-1)
+        acc = float((preds[~pad_mask] == tgt[~pad_mask]).mean()) if n_tokens > 0 else 0.0
+        # gradient wrt logits
+        dlogits = (probs - onehot) / n_tokens
+        dlogits[pad_mask] = 0.0
+        return loss, acc, dlogits
+
+    # ------------- Greedy decoding -------------
+
+    def greedy_decode(self, src_ids: np.ndarray, stoi_tgt: Dict[str, int], itos_tgt: Dict[int, str], max_len: int = 20) -> List[List[str]]:
+        self.dropout.training = False
+        B, Ts = src_ids.shape
+        # encode once
+        hs = self.embed_src.forward(src_ids) + self.pos_src.value[:Ts][None, :, :]
+        src_pad = (src_ids == SPECIAL_TOKENS["<PAD>"])
+        for layer in self.enc_layers:
+            hs = layer.forward(hs, training=False, src_pad=src_pad)
+        # start tokens
+        start = SPECIAL_TOKENS["[start]"]
+        end = SPECIAL_TOKENS["[end]"]
+        y = np.full((B, 1), start, dtype=np.int64)
+        decoded = [[] for _ in range(B)]
+        for t in range(max_len):
+            ht = self.embed_tgt.forward(y) + self.pos_tgt.value[: y.shape[1]][None, :, :]
+            dec_pad = (y == SPECIAL_TOKENS["<PAD>"])
+            h = ht
+            for layer in self.dec_layers:
+                h = layer.forward(h, enc_out=hs, training=False, dec_pad=dec_pad, enc_pad=src_pad)
+            logits = self.proj.forward(h)
+            probs = self.softmax(logits[:, -1:, :])  # last step
+            tok = probs.argmax(axis=-1)  # (B,1)
+            y = np.concatenate([y, tok], axis=1)
+            for i in range(B):
+                decoded[i].append(int(tok[i, 0]))
+        # cut at [end]
+        outs = []
+        for seq in decoded:
+            words = []
+            for idx in seq:
+                if idx == end:
+                    break
+                words.append(itos_tgt.get(idx, "<OOV>"))
+            outs.append(words)
+        return outs
+
+
+# =============================================================
+# Optimizer
+# =============================================================
+
+class RMSprop:
+    def __init__(self, params: List[Parameter], lr=1e-3, rho=0.9, eps=1e-8):
+        self.params = params
+        self.lr = lr
+        self.rho = rho
+        self.eps = eps
+        self.cache = {id(p): np.zeros_like(p.value) for p in params}
+
+    def step(self):
+        for p in self.params:
+            s = self.cache[id(p)]
+            s[...] = self.rho * s + (1 - self.rho) * (p.grad ** 2)
+            p.value[...] = p.value - self.lr * p.grad / (np.sqrt(s) + self.eps)
+
+
+# =============================================================
+# Dataset & training helpers
+# =============================================================
+
+def make_translation_pairs(pairs: List[Tuple[str, str]]) -> List[Tuple[str, str]]:
+    out = []
+    for en, es in pairs:
+        es2 = f"[start] {es} [end]"
+        out.append((en, es2))
     return out
 
 
-# ---------------------------
-# Mini-dataloader
-# ---------------------------
-
-def make_splits(pairs: List[Tuple[str, str]], val_ratio=0.15):
+def split_pairs(pairs: List[Tuple[str, str]], val_frac=0.15) -> Tuple[List[Tuple[str, str]], List[Tuple[str, str]], List[Tuple[str, str]]]:
     random.shuffle(pairs)
     n = len(pairs)
-    n_val = int(val_ratio * n)
+    n_val = int(val_frac * n)
     n_train = n - 2 * n_val
     train = pairs[:n_train]
     val = pairs[n_train:n_train + n_val]
@@ -118,484 +630,154 @@ def make_splits(pairs: List[Tuple[str, str]], val_ratio=0.15):
     return train, val, test
 
 
-def batches(pairs: List[Tuple[str, str]], batch_size: int, 
-            src_stoi: Dict[str, int], tgt_stoi: Dict[str, int]):
-    # Build tensors per batch
-    for i in range(0, len(pairs), batch_size):
-        chunk = pairs[i:i + batch_size]
-        src_txt = [p[0] for p in chunk]
-        tgt_txt = [p[1] for p in chunk]
-        src = vectorize(src_txt, src_stoi, sequence_length, standardize=None)
-        # target gets +1 for teacher forcing pair
-        tgt_full = vectorize(tgt_txt, tgt_stoi, sequence_length + 1, standardize=standardize_target)
-        # inputs to decoder (without last token) & targets (without first token)
-        dec_in = tgt_full[:, :-1]
-        dec_tg = tgt_full[:, 1:]
-        yield src, dec_in, dec_tg
+def texts_from_pairs(pairs: List[Tuple[str, str]]):
+    xs = [p[0] for p in pairs]
+    ys = [p[1] for p in pairs]
+    return xs, ys
+
+
+def encode_translation(pairs: List[Tuple[str, str]], stoi_src: Dict[str, int], stoi_tgt: Dict[str, int]) -> Tuple[List[List[int]], List[List[int]], List[List[int]]]:
+    X_src, Y_tgt = texts_from_pairs(pairs)
+    src_ids = [encode(x, stoi_src, is_target=False) for x in X_src]
+    tgt_ids_full = [encode(y, stoi_tgt, is_target=True) for y in Y_tgt]
+    # shift for teacher forcing
+    tgt_in = [seq[:-1] for seq in tgt_ids_full]
+    tgt_out = [seq[1:] for seq in tgt_ids_full]
+    return src_ids, tgt_in, tgt_out
+
+
+def iterate_minibatches_trans(
+    src_ids_all: List[List[int]], tgt_in_all: List[List[int]], tgt_out_all: List[List[int]],
+    batch_size: int, src_maxlen: int, tgt_maxlen: int, shuffle: bool = True,
+):
+    n = len(src_ids_all)
+    idx = np.arange(n)
+    if shuffle:
+        np.random.shuffle(idx)
+    for start in range(0, n, batch_size):
+        bidx = idx[start:start + batch_size]
+        src_batch = [src_ids_all[i] for i in bidx]
+        tgt_in_batch = [tgt_in_all[i] for i in bidx]
+        tgt_out_batch = [tgt_out_all[i] for i in bidx]
+        Xs = pad_batch(src_batch, src_maxlen)
+        Yi = pad_batch(tgt_in_batch, tgt_maxlen)
+        Yo = pad_batch(tgt_out_batch, tgt_maxlen)
+        yield Xs, Yi, Yo
+
+
+# =============================================================
+# Save / Load
+# =============================================================
+
+def save_weights(model: Seq2SeqTransformer, path: str):
+    data = {}
+    for p in model.params:
+        data[p.name] = p.value
+    np.savez(path, **data)
+
+
+def load_weights(model: Seq2SeqTransformer, path: str):
+    zz = np.load(path)
+    name_to_param = {p.name: p for p in model.params}
+    for k in zz.files:
+        if k in name_to_param:
+            name_to_param[k].value[...] = zz[k]
+        else:
+            print(f"[warn] extra weight in file: {k}")
+
+
+# =============================================================
+# Main training loop
+# =============================================================
 
-
-# ---------------------------
-# Layers / modules (NumPy)
-# ---------------------------
-
-def xavier_uniform(shape, rng):
-    fan_in, fan_out = shape[0], shape[1]
-    limit = math.sqrt(6.0 / (fan_in + fan_out))
-    return rng.uniform(-limit, limit, size=shape).astype(np.float32)
-
-
-def zeros(shape):
-    return np.zeros(shape, dtype=np.float32)
-
-
-def ones(shape):
-    return np.ones(shape, dtype=np.float32)
-
-
-class Linear:
-    def __init__(self, in_f, out_f, rng):
-        self.W = xavier_uniform((in_f, out_f), rng)
-        self.b = zeros((out_f,))
-        # grads
-        self.gW = np.zeros_like(self.W)
-        self.gb = np.zeros_like(self.b)
-
-    def __call__(self, x):
-        # x: (B, T, D)
-        y = x @ self.W + self.b
-        return y
-
-    def zero_grad(self):
-        self.gW.fill(0.0)
-        self.gb.fill(0.0)
-
-
-class LayerNorm:
-    def __init__(self, d_model, eps=1e-5):
-        self.gamma = ones((d_model,))
-        self.beta = zeros((d_model,))
-        self.eps = eps
-        self.ggamma = np.zeros_like(self.gamma)
-        self.gbeta = np.zeros_like(self.beta)
-
-    def __call__(self, x):
-        # x: (B, T, D)
-        mu = x.mean(axis=-1, keepdims=True)
-        var = x.var(axis=-1, keepdims=True)
-        xhat = (x - mu) / np.sqrt(var + self.eps)
-        return self.gamma * xhat + self.beta
-
-    # Gradients computed in backward elsewhere – this LN is used in a residual way
-    # For simplicity in this educational code, we treat LN as stateless in backward
-    # and approximate gradients via precomputed caches in blocks.
-
-
-class Embedding:
-    def __init__(self, vocab, d_model, rng):
-        self.E = rng.normal(0, 0.02, size=(vocab, d_model)).astype(np.float32)
-        self.gE = np.zeros_like(self.E)
-
-    def __call__(self, x):
-        # x: (B, T) int64
-        return self.E[x]
-
-    def zero_grad(self):
-        self.gE.fill(0.0)
-
-
-def causal_mask(T):
-    # (T, T) with -inf above diagonal
-    m = np.triu(np.ones((T, T), dtype=np.float32), k=1)
-    m[m == 1.0] = -np.inf
-    m[m == 0.0] = 0.0
-    return m  # add to logits before softmax
-
-
-def softmax(x, axis=-1):
-    x = x - np.max(x, axis=axis, keepdims=True)
-    e = np.exp(x)
-    return e / np.sum(e, axis=axis, keepdims=True)
-
-
-def relu(x):
-    return np.maximum(0.0, x)
-
-
-class MultiHeadAttention:
-    def __init__(self, d_model, num_heads, rng):
-        assert d_model % num_heads == 0
-        self.d_model = d_model
-        self.num_heads = num_heads
-        self.d_head = d_model // num_heads
-        # projections
-        self.Wq = Linear(d_model, d_model, rng)
-        self.Wk = Linear(d_model, d_model, rng)
-        self.Wv = Linear(d_model, d_model, rng)
-        self.Wo = Linear(d_model, d_model, rng)
-
-    def __call__(self, x_q, x_kv, attn_mask=None, key_padding_mask=None):
-        # x_q: (B,T_q,D), x_kv: (B,T_k,D)
-        B, Tq, D = x_q.shape
-        Tk = x_kv.shape[1]
-        q = self.Wq(x_q).reshape(B, Tq, self.num_heads, self.d_head).transpose(0,2,1,3)  # (B,H,Tq,dh)
-        k = self.Wk(x_kv).reshape(B, Tk, self.num_heads, self.d_head).transpose(0,2,1,3)  # (B,H,Tk,dh)
-        v = self.Wv(x_kv).reshape(B, Tk, self.num_heads, self.d_head).transpose(0,2,1,3)
-        # scaled dot-product
-        scores = (q @ k.transpose(0,1,3,2)) / math.sqrt(self.d_head)  # (B,H,Tq,Tk)
-        if attn_mask is not None:
-            # attn_mask: (Tq,Tk) broadcast to (B,H,Tq,Tk)
-            scores = scores + attn_mask
-        if key_padding_mask is not None:
-            # key_padding_mask: (B,1,1,Tk) with 0 for valid, -inf for pad
-            scores = scores + key_padding_mask
-        attn = softmax(scores, axis=-1)
-        y = attn @ v  # (B,H,Tq,dh)
-        y = y.transpose(0,2,1,3).reshape(B, Tq, D)
-        out = self.Wo(y)
-        return out
-
-
-class FeedForward:
-    def __init__(self, d_model, d_hidden, rng):
-        self.lin1 = Linear(d_model, d_hidden, rng)
-        self.lin2 = Linear(d_hidden, d_model, rng)
-
-    def __call__(self, x):
-        return self.lin2(relu(self.lin1(x)))
-
-
-class EncoderBlock:
-    def __init__(self, d_model, d_hidden, n_heads, rng):
-        self.mha = MultiHeadAttention(d_model, n_heads, rng)
-        self.ln1 = LayerNorm(d_model)
-        self.ff = FeedForward(d_model, d_hidden, rng)
-        self.ln2 = LayerNorm(d_model)
-
-    def __call__(self, x, key_padding_mask):
-        # Self-attention
-        sa = self.mha(x, x, attn_mask=None, key_padding_mask=key_padding_mask)
-        x = self.ln1(x + sa)
-        # FFN
-        ff = self.ff(x)
-        x = self.ln2(x + ff)
-        return x
-
-
-class DecoderBlock:
-    def __init__(self, d_model, d_hidden, n_heads, rng):
-        self.self_mha = MultiHeadAttention(d_model, n_heads, rng)
-        self.ln1 = LayerNorm(d_model)
-        self.cross_mha = MultiHeadAttention(d_model, n_heads, rng)
-        self.ln2 = LayerNorm(d_model)
-        self.ff = FeedForward(d_model, d_hidden, rng)
-        self.ln3 = LayerNorm(d_model)
-        self._cached_causal = None
-
-    def __call__(self, x, enc_out, self_attn_mask, self_kpm, enc_kpm):
-        sa = self.self_mha(x, x, attn_mask=self_attn_mask, key_padding_mask=self_kpm)
-        x = self.ln1(x + sa)
-        ca = self.cross_mha(x, enc_out, attn_mask=None, key_padding_mask=enc_kpm)
-        x = self.ln2(x + ca)
-        ff = self.ff(x)
-        x = self.ln3(x + ff)
-        return x
-
-
-class Transformer:
-    def __init__(self, src_vocab, tgt_vocab, d_model=256, d_hidden=2048, n_heads=8, n_layers=2, max_len=sequence_length+1, rng=None):
-        self.src_emb = Embedding(src_vocab, d_model, rng)
-        self.tgt_emb = Embedding(tgt_vocab, d_model, rng)
-        # Learned positional embeddings
-        self.pos_src = rng.normal(0, 0.02, size=(sequence_length, d_model)).astype(np.float32)
-        self.pos_tgt = rng.normal(0, 0.02, size=(max_len, d_model)).astype(np.float32)
-        self.g_pos_src = np.zeros_like(self.pos_src)
-        self.g_pos_tgt = np.zeros_like(self.pos_tgt)
-        self.enc_layers = [EncoderBlock(d_model, d_hidden, n_heads, rng) for _ in range(n_layers)]
-        self.dec_layers = [DecoderBlock(d_model, d_hidden, n_heads, rng) for _ in range(n_layers)]
-        self.proj = Linear(d_model, tgt_vocab, rng)
-        self.d_model = d_model
-        self.max_len = max_len
-
-    def encode(self, src_ids):
-        # src_ids: (B, Ts)
-        B, Ts = src_ids.shape
-        x = self.src_emb(src_ids) + self.pos_src[None, :Ts, :]
-        # build key padding mask: 0 for valid, -inf for pad positions
-        pad = (src_ids == PAD_ID).astype(np.float32)
-        kpm = pad[:, None, None, :] * (-1e9)
-        for layer in self.enc_layers:
-            x = layer(x, key_padding_mask=kpm)
-        return x, kpm
-
-    def decode(self, tgt_ids, enc_out, enc_kpm):
-        # tgt_ids: (B, Tt)
-        B, Tt = tgt_ids.shape
-        x = self.tgt_emb(tgt_ids) + self.pos_tgt[None, :Tt, :]
-        # causal mask (Tt,Tt)
-        cm = causal_mask(Tt)[None, None, :, :]  # (1,1,Tt,Tt)
-        # self key-padding mask for target (mask pads in keys)
-        pad = (tgt_ids == PAD_ID).astype(np.float32)
-        self_kpm = pad[:, None, None, :] * (-1e9)
-        for layer in self.dec_layers:
-            x = layer(x, enc_out, cm, self_kpm, enc_kpm)
-        return x
-
-    def forward(self, src_ids, tgt_in_ids):
-        enc_out, enc_kpm = self.encode(src_ids)
-        dec_h = self.decode(tgt_in_ids, enc_out, enc_kpm)
-        logits = self.proj(dec_h)  # (B,T,V)
-        return logits
-
-
-# ---------------------------
-# Loss / accuracy
-# ---------------------------
-
-def xent_loss(logits, targets, ignore_index=PAD_ID):
-    # logits: (B,T,V), targets: (B,T)
-    B, T, V = logits.shape
-    # gather logit of true class
-    logits_2d = logits.reshape(B*T, V)
-    targets_1d = targets.reshape(B*T)
-    mask = (targets_1d != ignore_index).astype(np.float32)
-    # log softmax
-    ls = logits_2d - np.max(logits_2d, axis=1, keepdims=True)
-    log_probs = ls - np.log(np.sum(np.exp(ls), axis=1, keepdims=True) + 1e-9)
-    idx = (np.arange(B*T), targets_1d)
-    nll = -log_probs[idx]
-    nll = nll * mask
-    denom = np.sum(mask) + 1e-9
-    return np.sum(nll) / denom
-
-
-def accuracy(logits, targets, ignore_index=PAD_ID):
-    pred = np.argmax(logits, axis=-1)
-    mask = (targets != ignore_index)
-    correct = (pred == targets) & mask
-    denom = np.sum(mask)
-    return (np.sum(correct), denom if denom > 0 else 1)
-
-
-# ---------------------------
-# Optimizer (Adam)
-# ---------------------------
-class Adam:
-    def __init__(self, params, lr=1e-3, b1=0.9, b2=0.999, eps=1e-8):
-        self.params = params
-        self.lr = lr
-        self.b1 = b1
-        self.b2 = b2
-        self.eps = eps
-        self.t = 0
-        self.m = [np.zeros_like(p) for p in params]
-        self.v = [np.zeros_like(p) for p in params]
-
-    def step(self, grads):
-        self.t += 1
-        for i, (p, g) in enumerate(zip(self.params, grads)):
-            self.m[i] = self.b1 * self.m[i] + (1 - self.b1) * g
-            self.v[i] = self.b2 * self.v[i] + (1 - self.b2) * (g * g)
-            mhat = self.m[i] / (1 - self.b1 ** self.t)
-            vhat = self.v[i] / (1 - self.b2 ** self.t)
-            p -= self.lr * mhat / (np.sqrt(vhat) + self.eps)
-
-
-# ---------------------------
-# Backprop scaffolding (automatic differentiation not used)
-# To keep this example tractable, we only backprop through the final softmax
-# projection and embeddings using a simple surrogate: treat encoder/decoder
-# blocks as fixed feature extractors during the first run, then optionally
-# unfreeze them by numerical gradient (very slow) or skip for demo training.
-#
-# For an educational yet runnable script, we'll train ONLY the output projection
-# and target embeddings (which already learns a simple LM conditioned via cross
-# attention). This gives sensible behavior quickly on CPU. For full training,
-# a full manual autograd would be required, which is beyond a concise example.
-# ---------------------------
-
-# In practice we: forward pass -> compute loss -> compute grad w.r.t. logits ->
-# backprop into proj.W, proj.b, and tgt_emb.E via chain rule.
-
-def grad_proj_and_tgt_emb(model: Transformer, src_ids, tgt_in_ids, targets):
-    # Forward
-    enc_out, enc_kpm = model.encode(src_ids)
-    dec_h = model.decode(tgt_in_ids, enc_out, enc_kpm)  # (B,T,D)
-    logits = model.proj(dec_h)  # (B,T,V)
-
-    B, T, V = logits.shape
-    # softmax gradient (with ignore_index) using dL/dlogits = p - y
-    probs = softmax(logits, axis=-1)
-    targets_1h = np.zeros_like(probs)
-    for b in range(B):
-        for t in range(T):
-            y = targets[b, t]
-            if y == PAD_ID:
-                continue
-            targets_1h[b, t, y] = 1.0
-    dlogits = (probs - targets_1h) / max(1, np.sum(targets != PAD_ID))  # average over valid tokens
-
-    # grads for proj
-    # logits = dec_h @ W + b
-    gW = (dec_h.reshape(B*T, -1).T @ dlogits.reshape(B*T, V)).astype(np.float32)
-    gb = dlogits.sum(axis=(0,1)).astype(np.float32)
-
-    # backprop into dec_h for embedding update
-    ddec_h = dlogits @ model.proj.W.T  # (B,T,D)
-
-    # grads for target embeddings via dec input: dec_in_emb = E[tgt_in_ids]
-    gE_tgt = np.zeros_like(model.tgt_emb.E)
-    # Treat decoder as identity for gradient routing to embeddings (approx)
-    # Accumulate gradient directly on input embeddings positions
-    # NOTE: This is a simplification for an educational demo.
-    for b in range(B):
-        for t in range(T):
-            idx = tgt_in_ids[b, t]
-            if idx != PAD_ID:
-                gE_tgt[idx] += ddec_h[b, t]
-
-    return logits, gW, gb, gE_tgt
-
-
-# ---------------------------
-# Training loop (projection + tgt embeddings only)
-# ---------------------------
-
-def train(model: Transformer, train_pairs, val_pairs, src_stoi, tgt_stoi, epochs=3, lr=1e-3):
-    params = [model.proj.W, model.proj.b, model.tgt_emb.E]
-    opt = Adam(params, lr=lr)
-
-    for ep in range(1, epochs+1):
-        random.shuffle(train_pairs)
-        tot_loss = 0.0
-        tot_corr = 0
-        tot_cnt = 0
-        n_batches = 0
-        for src_ids, dec_in, dec_tg in batches(train_pairs, batch_size, src_stoi, tgt_stoi):
-            logits, gW, gb, gE_tgt = grad_proj_and_tgt_emb(model, src_ids, dec_in, dec_tg)
-            loss = xent_loss(logits, dec_tg)
-            c, d = accuracy(logits, dec_tg)
-            tot_loss += loss
-            tot_corr += c
-            tot_cnt += d
-            n_batches += 1
-            # step
-            opt.step([gW, gb, gE_tgt])
-        val_loss, val_acc = evaluate(model, val_pairs, src_stoi, tgt_stoi)
-        print(f"Epoch {ep}: train_loss={tot_loss/max(1,n_batches):.4f} train_acc={tot_corr/max(1,tot_cnt):.4f} | val_loss={val_loss:.4f} val_acc={val_acc:.4f}")
-
-def train_estimation(model, train_pairs, val_pairs, src_stoi, tgt_stoi, epochs=1, lr=1e-3):
-    params = [model.proj.W, model.proj.b, model.tgt_emb.E]
-    opt = Adam(params, lr=lr)
-
-    epoch_batches = math.ceil(len(train_pairs) / batch_size)
-    warmup = 10            # don’t measure first few batches
-    measure_steps = 100    # measure next N batches for a quick read
-
-    for ep in range(1, epochs+1):
-        random.shuffle(train_pairs)
-        t0 = time.perf_counter()
-        times = []
-        bcount = 0
-        tot_loss = 0.0; tot_corr = 0; tot_cnt = 0; n_batches = 0
-
-        for src_ids, dec_in, dec_tg in batches(train_pairs, batch_size, src_stoi, tgt_stoi):
-            t1 = time.perf_counter()
-            logits, gW, gb, gE_tgt = grad_proj_and_tgt_emb(model, src_ids, dec_in, dec_tg)
-            loss = xent_loss(logits, dec_tg)
-            c, d = accuracy(logits, dec_tg)
-            tot_loss += loss; tot_corr += c; tot_cnt += d; n_batches += 1
-            opt.step([gW, gb, gE_tgt])
-
-            t2 = time.perf_counter()
-            bcount += 1
-            if bcount > warmup and len(times) < measure_steps:
-                times.append(t2 - t1)
-            if len(times) == measure_steps:
-                break  # stop early after we have a good sample
-
-        avg_batch_s = sum(times) / max(1, len(times))
-        approx_epoch_s = avg_batch_s * epoch_batches
-        print(f"≈ {avg_batch_s*1000:.1f} ms/batch → ≈ {approx_epoch_s/60:.1f} min/epoch (batch_size={batch_size}, steps/epoch≈{epoch_batches})")
-
-
-def evaluate(model: Transformer, pairs, src_stoi, tgt_stoi):
-    losses = []
-    corr = 0
-    cnt = 0
-    for src_ids, dec_in, dec_tg in batches(pairs, batch_size, src_stoi, tgt_stoi):
-        logits = model.forward(src_ids, dec_in)
-        losses.append(xent_loss(logits, dec_tg))
-        c, d = accuracy(logits, dec_tg)
-        corr += c
-        cnt += d
-    return (sum(losses)/max(1,len(losses)), corr/max(1,cnt))
-
-
-# ---------------------------
-# Decoding (greedy)
-# ---------------------------
-
-def greedy_decode(model: Transformer, sentence: str, src_stoi, tgt_stoi, tgt_itos, max_len=20):
-    src = vectorize([sentence], src_stoi, sequence_length)
-    enc_out, enc_kpm = model.encode(src)
-    cur = np.full((1, 1), START_ID, dtype=np.int64)
-    out_tokens = []
-    for t in range(max_len):
-        dec_h = model.decode(cur, enc_out, enc_kpm)
-        logits = model.proj(dec_h)  # (1,t+1,V)
-        next_id = int(np.argmax(logits[0, -1]))
-        tok = tgt_itos[next_id] if next_id < len(tgt_itos) else UNK
-        if tok == END:
-            break
-        out_tokens.append(tok)
-        cur = np.concatenate([cur, np.array([[next_id]], dtype=np.int64)], axis=1)
-    return f"{START} " + " ".join(out_tokens) + f" {END}"
-
-
-# ---------------------------
-# Main
-# ---------------------------
 if __name__ == "__main__":
-    assert os.path.exists(DATA_PATH), f"Dataset not found at {DATA_PATH}"
+    import argparse
 
-    pairs = load_pairs(DATA_PATH)
-    train_pairs, val_pairs, test_pairs = make_splits(pairs, val_ratio=0.15)
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--spa_dir", type=str, default="./spa-eng")
+    parser.add_argument("--vocab_src", type=int, default=15000)
+    parser.add_argument("--vocab_tgt", type=int, default=15000)
+    parser.add_argument("--embed_dim", type=int, default=256)
+    parser.add_argument("--num_heads", type=int, default=8)
+    parser.add_argument("--ff_hidden", type=int, default=1024)
+    parser.add_argument("--enc_layers", type=int, default=1)
+    parser.add_argument("--dec_layers", type=int, default=1)
+    parser.add_argument("--dropout", type=float, default=0.1)
+    parser.add_argument("--src_maxlen", type=int, default=20)
+    parser.add_argument("--tgt_maxlen", type=int, default=20)
+    parser.add_argument("--epochs", type=int, default=5)
+    parser.add_argument("--batch_size", type=int, default=64)
+    parser.add_argument("--lr", type=float, default=1e-3)
+    parser.add_argument("--weights", type=str, default="transformer_seq2seq_np.npz")
+    args = parser.parse_args()
 
-    train_en = [p[0] for p in train_pairs]
-    train_es = [p[1] for p in train_pairs]
+    print("Loading spa-eng pairs...")
+    all_pairs = load_spa_eng(args.spa_dir)
+    all_pairs = make_translation_pairs(all_pairs)
 
-    src_stoi, src_itos = build_vocab(train_en, vocab_size, standardize=None)
-    # Ensure specials at fixed ids
-    for i, tok in enumerate(SPECIALS):
-        src_stoi[tok] = i
-    src_itos[:len(SPECIALS)] = SPECIALS
+    train_pairs, val_pairs, test_pairs = split_pairs(all_pairs, val_frac=0.15)
+    print(f"Train {len(train_pairs)} | Val {len(val_pairs)} | Test {len(test_pairs)}")
 
-    tgt_stoi, tgt_itos = build_vocab(train_es, vocab_size, standardize=standardize_target)
-    for i, tok in enumerate(SPECIALS):
-        tgt_stoi[tok] = i
-    tgt_itos[:len(SPECIALS)] = SPECIALS
+    src_texts_train, tgt_texts_train = texts_from_pairs(train_pairs)
+    stoi_src = build_vocab(src_texts_train, args.vocab_src, is_target=False)
+    stoi_tgt = build_vocab(tgt_texts_train, args.vocab_tgt, is_target=True)
+    itos_tgt = {i: w for w, i in stoi_tgt.items()}
 
-    print("Sample pair:", random.choice(train_pairs))
+    Xs_tr, Yi_tr, Yo_tr = encode_translation(train_pairs, stoi_src, stoi_tgt)
+    Xs_va, Yi_va, Yo_va = encode_translation(val_pairs, stoi_src, stoi_tgt)
 
-    # Model
-    d_model = 256
-    d_hidden = 2048
-    n_heads = 8
-    n_layers = 2
-    model = Transformer(len(src_itos), len(tgt_itos), d_model, d_hidden, n_heads, n_layers, max_len=sequence_length+1, rng=rng)
+    model = Seq2SeqTransformer(
+        src_vocab=len(stoi_src), tgt_vocab=len(stoi_tgt),
+        embed_dim=args.embed_dim, num_heads=args.num_heads, ff_hidden=args.ff_hidden,
+        num_enc_layers=args.enc_layers, num_dec_layers=args.dec_layers,
+        dropout_p=args.dropout, max_len=max(args.src_maxlen, args.tgt_maxlen), seed=0,
+    )
 
-    # Quick sanity batch
-    src_b, dec_in_b, dec_tg_b = next(batches(train_pairs, batch_size, src_stoi, tgt_stoi))
-    logits = model.forward(src_b, dec_in_b)
-    print("Sanity forward: logits shape:", logits.shape)
+    opt = RMSprop(model.params, lr=args.lr)
 
-    # Train a few epochs (projection+tgt embeddings only)
-    train(model, train_pairs, val_pairs, src_stoi, tgt_stoi, epochs=3, lr=1e-3)
+    best_val = 1e9
+    for ep in range(1, args.epochs + 1):
+        # ---------------- Train ----------------
+        start_time = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
+        print(f"Epoch {ep:02d} starting at {start_time}")
+        losses = []
+        accs = []
+        for Xs, Yi, Yo in iterate_minibatches_trans(Xs_tr, Yi_tr, Yo_tr, args.batch_size, args.src_maxlen, args.tgt_maxlen, shuffle=True):
+            model.zero_grad()
+            logits = model.forward(Xs, Yi, training=True)
+            loss, acc, dlogits = model.loss_and_acc(logits, Yo, pad_id=SPECIAL_TOKENS["<PAD>"])
+            losses.append(loss)
+            accs.append(acc)
+            model.backward(dlogits)
+            opt.step()
+        tr_loss = float(np.mean(losses)) if losses else float('nan')
+        tr_acc = float(np.mean(accs)) if accs else 0.0
 
-    # Decode some samples
-    print("\nGreedy decode samples:")
-    test_eng = [p[0] for p in test_pairs]
-    for _ in range(5):
-        s = random.choice(test_eng)
-        print("-", s)
-        print(greedy_decode(model, s, src_stoi, tgt_stoi, tgt_itos, max_len=20))
+        # ---------------- Val ----------------
+        v_losses = []
+        v_accs = []
+        for Xs, Yi, Yo in iterate_minibatches_trans(Xs_va, Yi_va, Yo_va, args.batch_size, args.src_maxlen, args.tgt_maxlen, shuffle=False):
+            logits = model.forward(Xs, Yi, training=False)
+            loss, acc, _ = model.loss_and_acc(logits, Yo, pad_id=SPECIAL_TOKENS["<PAD>"])
+            v_losses.append(loss)
+            v_accs.append(acc)
+        va_loss = float(np.mean(v_losses)) if v_losses else float('nan')
+        va_acc = float(np.mean(v_accs)) if v_accs else 0.0
+
+        print(f"Epoch {ep:02d}: train_loss={tr_loss:.4f} acc={tr_acc:.3f} | val_loss={va_loss:.4f} acc={va_acc:.3f}")
+
+        if va_loss < best_val:
+            best_val = va_loss
+            save_weights(model, args.weights)
+            print(f"  ↑ Saved best to {args.weights} (val_loss={best_val:.4f})")
+
+    # ---------------- Test a few samples ----------------
+    print("Loading best weights and decoding samples...")
+    load_weights(model, args.weights)
+    Xs_te, Yi_te, Yo_te = encode_translation(test_pairs[:64], stoi_src, stoi_tgt)
+    Xs = pad_batch(Xs_te, args.src_maxlen)
+    dec_words = model.greedy_decode(Xs, stoi_tgt, itos_tgt, max_len=args.tgt_maxlen)
+    for i in range(min(10, len(test_pairs))):
+        print("-")
+        print("EN:", test_pairs[i][0])
+        print("ES:", " ".join(dec_words[i]))
