@@ -713,7 +713,7 @@ if __name__ == "__main__":
 
     print("Loading spa-eng pairs...")
     all_pairs = load_spa_eng(args.spa_dir)
-    all_pairs = make_translation_pairs(all_pairs)
+    all_pairs = make_translation_pairs(all_pairs) # 'Go.' -> '[start] Ve. [end]'
 
     train_pairs, val_pairs, test_pairs = split_pairs(all_pairs, val_frac=0.15)
     print(f"Train {len(train_pairs)} | Val {len(val_pairs)} | Test {len(test_pairs)}")
@@ -744,7 +744,7 @@ if __name__ == "__main__":
         accs = []
         for Xs, Yi, Yo in iterate_minibatches_trans(Xs_tr, Yi_tr, Yo_tr, args.batch_size, args.src_maxlen, args.tgt_maxlen, shuffle=True):
             model.zero_grad()
-            logits = model.forward(Xs, Yi, training=True)
+            logits = model.forward(Xs, Yi, training=True) #Xs.shape=(64,20) Yi.shape=(64,20) logits.shape=(64,20,15000)
             loss, acc, dlogits = model.loss_and_acc(logits, Yo, pad_id=SPECIAL_TOKENS["<PAD>"])
             losses.append(loss)
             accs.append(acc)
