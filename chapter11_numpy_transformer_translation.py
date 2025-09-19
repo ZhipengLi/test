@@ -22,22 +22,36 @@ SPECIAL_TOKENS = {
 }
 
 
+# def clean_text_en(t: str) -> str:
+#     t = t.lower()
+#     t = re.sub(r"<.*?>", " ", t)
+#     t = re.sub(r"[^a-z0-9' ]+", " ", t)
+#     t = re.sub(r"\s+", " ", t).strip()
+#     return t
+
+
+# def clean_text_es(t: str) -> str:
+#     t = t.lower()
+#     # keep accented letters and ñ, ¿, ¡
+#     t = re.sub(r"<.*?>", " ", t)
+#     t = re.sub(r"[^a-z0-9áéíóúüñ¿¡' ]+", " ", t)
+#     t = re.sub(r"\s+", " ", t).strip()
+#     return t
 def clean_text_en(t: str) -> str:
     t = t.lower()
     t = re.sub(r"<.*?>", " ", t)
-    t = re.sub(r"[^a-z0-9' ]+", " ", t)
+    # allow [] so [start]/[end] are preserved
+    t = re.sub(r"[^a-z0-9'\[\] ]+", " ", t)
     t = re.sub(r"\s+", " ", t).strip()
     return t
-
 
 def clean_text_es(t: str) -> str:
     t = t.lower()
-    # keep accented letters and ñ, ¿, ¡
     t = re.sub(r"<.*?>", " ", t)
-    t = re.sub(r"[^a-z0-9áéíóúüñ¿¡' ]+", " ", t)
+    # allow [] so [start]/[end] are preserved
+    t = re.sub(r"[^a-z0-9áéíóúüñ¿¡'\[\] ]+", " ", t)
     t = re.sub(r"\s+", " ", t).strip()
     return t
-
 
 def build_vocab(texts: List[str], vocab_size: int, is_target: bool = False) -> Dict[str, int]:
     counter = Counter()
@@ -443,22 +457,22 @@ class TransformerDecoderBlock:
 class Seq2SeqTransformer:
     def __init__(self, src_vocab: int, tgt_vocab: int, embed_dim: int = 256, num_heads: int = 8, ff_hidden: int = 1024,
                  num_enc_layers: int = 1, num_dec_layers: int = 1, dropout_p: float = 0.1, max_len: int = 128, seed: int = 0):
-        self.embed_src = Embedding(src_vocab, embed_dim, seed=seed, name="src_emb")
-        self.embed_tgt = Embedding(tgt_vocab, embed_dim, seed=seed + 1, name="tgt_emb")
+        self.embed_src = Embedding(src_vocab, embed_dim, seed=seed, name="src_emb") # src_vocab = 12017, embed_dim=256
+        self.embed_tgt = Embedding(tgt_vocab, embed_dim, seed=seed + 1, name="tgt_emb") # tgt_vocab = 20004, embed_dim=256
         rng = np.random.default_rng(seed + 7)
-        self.pos_src = Parameter(rng.normal(0, 0.02, size=(max_len, embed_dim)).astype(np.float32), "pos/src")
+        self.pos_src = Parameter(rng.normal(0, 0.02, size=(max_len, embed_dim)).astype(np.float32), "pos/src") # max_len=128, embed_dim=256
         self.pos_tgt = Parameter(rng.normal(0, 0.02, size=(max_len, embed_dim)).astype(np.float32), "pos/tgt")
         self.enc_layers = [
             TransformerEncoderBlock(embed_dim, ff_hidden, num_heads, dropout_p=dropout_p, seed=seed + i * 100, name=f"enc{i}")
-            for i in range(num_enc_layers)
+            for i in range(num_enc_layers) # embed_dim=256, ff_hidden=1024, num_heads=8, dropout_p=0.1, num_enc_layers=1
         ]
         self.dec_layers = [
             TransformerDecoderBlock(embed_dim, ff_hidden, num_heads, dropout_p=dropout_p, seed=seed + 1000 + i * 100, name=f"dec{i}")
-            for i in range(num_dec_layers)
+            for i in range(num_dec_layers) # embed_dim=256, ff_hidden=1024, num_heads=8, dropout_p=0.1, num_dec_layers=1
         ]
-        self.proj = Dense(embed_dim, tgt_vocab, name="proj", seed=seed + 9999)
-        self.dropout = Dropout(dropout_p, seed=seed + 4242)
-        self.max_len = max_len
+        self.proj = Dense(embed_dim, tgt_vocab, name="proj", seed=seed + 9999) # embed_dim=256, tgt_vocab=20004
+        self.dropout = Dropout(dropout_p, seed=seed + 4242) # dropout_p=0.1
+        self.max_len = max_len # 128
         self.training = True
         # caches for backward across layer stacks
         self._cache_enc_inputs = None
@@ -478,24 +492,24 @@ class Seq2SeqTransformer:
 
     def forward(self, src_ids: np.ndarray, tgt_in_ids: np.ndarray, training: bool = True) -> np.ndarray:
         self.training = training
-        B, Ts = src_ids.shape
-        _, Tt = tgt_in_ids.shape
+        B, Ts = src_ids.shape # src_ids.shape = (32, 20), B=32, Ts=20
+        _, Tt = tgt_in_ids.shape # tgt_in_ids.shape = (32, 20), Tt=20
         # Embeddings + positions
-        hs = self.embed_src.forward(src_ids) + self.pos_src.value[:Ts][None, :, :]
-        ht = self.embed_tgt.forward(tgt_in_ids) + self.pos_tgt.value[:Tt][None, :, :]
+        hs = self.embed_src.forward(src_ids) + self.pos_src.value[:Ts][None, :, :] # self.pos_src.value.shape=(128, 256), hs.shape = (32, 20, 256)
+        ht = self.embed_tgt.forward(tgt_in_ids) + self.pos_tgt.value[:Tt][None, :, :] # self.pos_tgt.value.shape=(128, 256), ht.shape = (32, 20, 256)
         # masks
-        src_pad = (src_ids == SPECIAL_TOKENS["<PAD>"])
-        tgt_pad = (tgt_in_ids == SPECIAL_TOKENS["<PAD>"])
+        src_pad = (src_ids == SPECIAL_TOKENS["<PAD>"]) # src_pad.shape = (32, 20)
+        tgt_pad = (tgt_in_ids == SPECIAL_TOKENS["<PAD>"]) # tgt_pad.shape = (32, 20)
         # Encoder
-        for layer in self.enc_layers:
-            hs = layer.forward(hs, training=training, src_pad=src_pad)
+        for layer in self.enc_layers: # only 1 layer
+            hs = layer.forward(hs, training=training, src_pad=src_pad) # hs.shape = (64,20,256) -> (64,20,256), src_pad.shape = (64,20)
         # Decoder
-        for layer in self.dec_layers:
-            ht = layer.forward(ht, enc_out=hs, training=training, dec_pad=tgt_pad, enc_pad=src_pad)
+        for layer in self.dec_layers: # only 1 layer
+            ht = layer.forward(ht, enc_out=hs, training=training, dec_pad=tgt_pad, enc_pad=src_pad) # ht.shape = (64,20,256) -> (64,20,256), tgt_pad.shape = (64,20), src_pad.shape = (64,20)
         # Final proj to vocab (apply dropout on decoder outputs)
         self.dropout.training = training
-        h = self.dropout.forward(ht)
-        logits = self.proj.forward(h)  # (B,Tt,V)
+        h = self.dropout.forward(ht) # ht.shape = (64,20,256) -> h.shape = (64,20,256)
+        logits = self.proj.forward(h)  # h.shape= (64,20,256) -> logits.shape = (64,20,20004)
         # cache for backward routing
         self._cache_enc_inputs = (src_pad,)
         self._cache_dec_inputs = (tgt_pad,)
@@ -503,20 +517,20 @@ class Seq2SeqTransformer:
 
     def backward(self, dlogits: np.ndarray):
         # dlogits: (B,T,V)
-        dh = self.proj.backward(dlogits)
-        dh = self.dropout.backward(dh)
+        dh = self.proj.backward(dlogits) # dlogits.shape = (64,20,14998) -> dh.shape = (64,20,256)
+        dh = self.dropout.backward(dh) # dh.shape = (64,20,256)
         # back through decoder stack
         denc_accum = 0
-        for layer in reversed(self.dec_layers):
-            dh, denc = layer.backward(dh)
-            denc_accum = denc_accum + denc
+        for layer in reversed(self.dec_layers): # only 1 layer
+            dh, denc = layer.backward(dh) # dh.shape = (64,20,256) -> dh.shape = (64,20,256), denc.shape = (64,20,256)
+            denc_accum = denc_accum + denc # denc_accum.shape = (64,20,256)
         # back through encoder stack (propagate denc_accum)
-        grad = denc_accum
-        for layer in reversed(self.enc_layers):
-            grad = layer.backward(grad)
+        grad = denc_accum # grad.shape = (64,20,256)
+        for layer in reversed(self.enc_layers): # only 1 layer
+            grad = layer.backward(grad) # grad.shape = (64,20,256) -> grad.shape = (64,20,256)
         # back into embeddings
-        self.embed_tgt.backward(dh)
-        self.embed_src.backward(grad)
+        self.embed_tgt.backward(dh) # dh.shape = (64,20,256)
+        self.embed_src.backward(grad) # grad.shape = (64,20,256)
 
     # ------------- Loss / metrics -------------
 
@@ -528,30 +542,65 @@ class Seq2SeqTransformer:
 
     def loss_and_acc(self, logits: np.ndarray, tgt_out_ids: np.ndarray, pad_id: int = 0) -> Tuple[float, float, np.ndarray]:
         # logits: (B,T,V) ; tgt_out_ids: (B,T)
-        probs = self.softmax(logits)
-        B, T, V = probs.shape
+        probs = self.softmax(logits) # logits.shape = (64,20,14998), probs.shape = (64,20,14998)
+        B, T, V = probs.shape # B=64, T=20, V=14998
         onehot = np.zeros_like(probs)
         # mask out-of-range ids
-        tgt = np.clip(tgt_out_ids, 0, V - 1)
+        tgt = np.clip(tgt_out_ids, 0, V - 1) # tgt_out_ids.shape = (64,20), tgt.shape = (64,20)
         onehot[np.arange(B)[:, None], np.arange(T)[None, :], tgt] = 1.0
         # cross-entropy with mask
-        pad_mask = (tgt_out_ids == pad_id)
+        pad_mask = (tgt_out_ids == pad_id) # tgt_out_ids.shape = (64,20), pad_mask.shape = (64,20)
         # avoid log(0)
         logp = np.log(probs + 1e-12)
-        nll = - (onehot * logp).sum(axis=-1)  # (B,T)
+        nll = - (onehot * logp).sum(axis=-1) # onehot.shape = (64,20,14998), logp.shape = (64,20,14998) , nll.shape = (64,20)
         n_tokens = np.maximum(1, (~pad_mask).sum())
         loss = float(nll[~pad_mask].sum() / n_tokens)
         # accuracy
-        preds = probs.argmax(axis=-1)
+        preds = probs.argmax(axis=-1) # probs.shape = (64,20,14998), preds.shape = (64,20)
         acc = float((preds[~pad_mask] == tgt[~pad_mask]).mean()) if n_tokens > 0 else 0.0
         # gradient wrt logits
         dlogits = (probs - onehot) / n_tokens
-        dlogits[pad_mask] = 0.0
+        dlogits[pad_mask] = 0.0 # dlogits.shape = (64,20,14998)
         return loss, acc, dlogits
 
     # ------------- Greedy decoding -------------
 
-    def greedy_decode(self, src_ids: np.ndarray, stoi_tgt: Dict[str, int], itos_tgt: Dict[int, str], max_len: int = 20) -> List[List[str]]:
+    # def greedy_decode(self, src_ids: np.ndarray, stoi_tgt: Dict[str, int], itos_tgt: Dict[int, str], max_len: int = 20) -> List[List[str]]:
+    #     self.dropout.training = False
+    #     B, Ts = src_ids.shape
+    #     # encode once
+    #     hs = self.embed_src.forward(src_ids) + self.pos_src.value[:Ts][None, :, :]
+    #     src_pad = (src_ids == SPECIAL_TOKENS["<PAD>"])
+    #     for layer in self.enc_layers:
+    #         hs = layer.forward(hs, training=False, src_pad=src_pad)
+    #     # start tokens
+    #     start = SPECIAL_TOKENS["[start]"]
+    #     end = SPECIAL_TOKENS["[end]"]
+    #     y = np.full((B, 1), start, dtype=np.int64)
+    #     decoded = [[] for _ in range(B)]
+    #     for t in range(max_len):
+    #         ht = self.embed_tgt.forward(y) + self.pos_tgt.value[: y.shape[1]][None, :, :]
+    #         dec_pad = (y == SPECIAL_TOKENS["<PAD>"])
+    #         h = ht
+    #         for layer in self.dec_layers:
+    #             h = layer.forward(h, enc_out=hs, training=False, dec_pad=dec_pad, enc_pad=src_pad)
+    #         logits = self.proj.forward(h)
+    #         probs = self.softmax(logits[:, -1:, :])  # last step
+    #         tok = probs.argmax(axis=-1)  # (B,1)
+    #         y = np.concatenate([y, tok], axis=1)
+    #         for i in range(B):
+    #             decoded[i].append(int(tok[i, 0]))
+    #     # cut at [end]
+    #     outs = []
+    #     for seq in decoded:
+    #         words = []
+    #         for idx in seq:
+    #             if idx == end:
+    #                 break
+    #             words.append(itos_tgt.get(idx, "<OOV>"))
+    #         outs.append(words)
+    #     return outs
+    def greedy_decode(self, src_ids, stoi_tgt, itos_tgt, max_len=20):
         self.dropout.training = False
         B, Ts = src_ids.shape
         # encode once
@@ -559,34 +608,47 @@ class Seq2SeqTransformer:
         src_pad = (src_ids == SPECIAL_TOKENS["<PAD>"])
         for layer in self.enc_layers:
             hs = layer.forward(hs, training=False, src_pad=src_pad)
-        # start tokens
-        start = SPECIAL_TOKENS["[start]"]
-        end = SPECIAL_TOKENS["[end]"]
-        y = np.full((B, 1), start, dtype=np.int64)
-        decoded = [[] for _ in range(B)]
-        for t in range(max_len):
+
+        start_id = SPECIAL_TOKENS["[start]"]
+        end_id = SPECIAL_TOKENS["[end]"]
+
+        y = np.full((B, 1), start_id, dtype=np.int64)
+        finished = np.zeros((B,), dtype=bool)
+        decoded_ids = [[] for _ in range(B)]
+
+        for _ in range(max_len):
             ht = self.embed_tgt.forward(y) + self.pos_tgt.value[: y.shape[1]][None, :, :]
             dec_pad = (y == SPECIAL_TOKENS["<PAD>"])
             h = ht
             for layer in self.dec_layers:
                 h = layer.forward(h, enc_out=hs, training=False, dec_pad=dec_pad, enc_pad=src_pad)
             logits = self.proj.forward(h)
-            probs = self.softmax(logits[:, -1:, :])  # last step
-            tok = probs.argmax(axis=-1)  # (B,1)
+            probs = self.softmax(logits[:, -1:, :])  # (B,1,V)
+            tok = probs.argmax(axis=-1).astype(np.int64)  # (B,1)
+
+            # don’t advance finished sequences
+            tok[finished, 0] = end_id
             y = np.concatenate([y, tok], axis=1)
+
             for i in range(B):
-                decoded[i].append(int(tok[i, 0]))
-        # cut at [end]
+                if not finished[i]:
+                    tid = int(tok[i, 0])
+                    decoded_ids[i].append(tid)
+                    if tid == end_id:
+                        finished[i] = True
+            if finished.all():
+                break
+
+        # map to words, cut at end_id
         outs = []
-        for seq in decoded:
+        for seq in decoded_ids:
             words = []
             for idx in seq:
-                if idx == end:
+                if idx == end_id:
                     break
                 words.append(itos_tgt.get(idx, "<OOV>"))
             outs.append(words)
         return outs
-
 
 # =============================================================
 # Optimizer
