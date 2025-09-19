@@ -53,20 +53,42 @@ def clean_text_es(t: str) -> str:
     t = re.sub(r"\s+", " ", t).strip()
     return t
 
+# def build_vocab(texts: List[str], vocab_size: int, is_target: bool = False) -> Dict[str, int]:
+#     counter = Counter()
+#     for t in texts:
+#         ct = clean_text_es(t) if is_target else clean_text_en(t)
+#         counter.update(ct.split())
+#     # reserve special ids
+#     base = list(SPECIAL_TOKENS.keys())
+#     most_common = [w for w, _ in counter.most_common(max(0, vocab_size - len(base)))]
+#     stoi = {tok: idx for tok, idx in SPECIAL_TOKENS.items()}
+#     for i, w in enumerate(most_common, start=len(SPECIAL_TOKENS)):
+#         if w not in stoi:
+#             stoi[w] = i
+#     return stoi
 def build_vocab(texts: List[str], vocab_size: int, is_target: bool = False) -> Dict[str, int]:
     counter = Counter()
     for t in texts:
         ct = clean_text_es(t) if is_target else clean_text_en(t)
         counter.update(ct.split())
-    # reserve special ids
-    base = list(SPECIAL_TOKENS.keys())
-    most_common = [w for w, _ in counter.most_common(max(0, vocab_size - len(base)))]
-    stoi = {tok: idx for tok, idx in SPECIAL_TOKENS.items()}
-    for i, w in enumerate(most_common, start=len(SPECIAL_TOKENS)):
-        if w not in stoi:
-            stoi[w] = i
-    return stoi
 
+    # Remove any specials if they appear in the corpus (they do, since you injected [start]/[end])
+    for tok in SPECIAL_TOKENS:
+        counter.pop(tok, None)
+
+    stoi = {tok: idx for tok, idx in SPECIAL_TOKENS.items()}
+
+    # Fill remaining slots contiguously
+    next_id = len(SPECIAL_TOKENS)
+    for w, _ in counter.most_common():
+        if next_id >= vocab_size:
+            break
+        stoi[w] = next_id
+        next_id += 1
+
+    # Sanity check: ids must be 0..len(stoi)-1 with no holes
+    assert max(stoi.values()) == len(stoi) - 1, "Vocab ids not contiguous"
+    return stoi
 
 def encode(text: str, stoi: Dict[str, int], is_target: bool = False) -> List[int]:
     t = clean_text_es(text) if is_target else clean_text_en(text)
@@ -371,7 +393,8 @@ class TransformerEncoderBlock:
         dx = dout + dx2
         dh1 = self.drop1.backward(dx)
         dq, dk, dv = self.attn.backward(dh1)
-        dx1 = self.ln1.backward(dq)  # attn is pre-norm; gradient path via q only
+        #dx1 = self.ln1.backward(dq)  # attn is pre-norm; gradient path via q only
+        dx1 = self.ln1.backward(dq + dk + dv)  # FIX: sum grads from Q,K,V
         # residual: add gradient that flowed around attn (dx)
         return dx1 + dx
 
@@ -435,7 +458,8 @@ class TransformerDecoderBlock:
         dy = dy + dy2
         dh1 = self.drop1.backward(dy)
         dq_self, dk_self, dv_self = self.self_attn.backward(dh1)
-        dy1 = self.ln1.backward(dq_self)
+        #dy1 = self.ln1.backward(dq_self)
+        dy1 = self.ln1.backward(dq_self + dk_self + dv_self)  # FIX
         dy_total = dy1 + dy
         # encoder receives dk_cross + dv_cross via its output (k,v are projections of enc_out)
         denc = dk_cross + dv_cross
