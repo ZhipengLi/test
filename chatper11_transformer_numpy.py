@@ -21,22 +21,6 @@ SPECIAL_TOKENS = {
     "[end]": 3,
 }
 
-
-# def clean_text_en(t: str) -> str:
-#     t = t.lower()
-#     t = re.sub(r"<.*?>", " ", t)
-#     t = re.sub(r"[^a-z0-9' ]+", " ", t)
-#     t = re.sub(r"\s+", " ", t).strip()
-#     return t
-
-
-# def clean_text_es(t: str) -> str:
-#     t = t.lower()
-#     # keep accented letters and ñ, ¿, ¡
-#     t = re.sub(r"<.*?>", " ", t)
-#     t = re.sub(r"[^a-z0-9áéíóúüñ¿¡' ]+", " ", t)
-#     t = re.sub(r"\s+", " ", t).strip()
-#     return t
 def clean_text_en(t: str) -> str:
     t = t.lower()
     t = re.sub(r"<.*?>", " ", t)
@@ -53,19 +37,6 @@ def clean_text_es(t: str) -> str:
     t = re.sub(r"\s+", " ", t).strip()
     return t
 
-# def build_vocab(texts: List[str], vocab_size: int, is_target: bool = False) -> Dict[str, int]:
-#     counter = Counter()
-#     for t in texts:
-#         ct = clean_text_es(t) if is_target else clean_text_en(t)
-#         counter.update(ct.split())
-#     # reserve special ids
-#     base = list(SPECIAL_TOKENS.keys())
-#     most_common = [w for w, _ in counter.most_common(max(0, vocab_size - len(base)))]
-#     stoi = {tok: idx for tok, idx in SPECIAL_TOKENS.items()}
-#     for i, w in enumerate(most_common, start=len(SPECIAL_TOKENS)):
-#         if w not in stoi:
-#             stoi[w] = i
-#     return stoi
 def build_vocab(texts: List[str], vocab_size: int, is_target: bool = False) -> Dict[str, int]:
     counter = Counter()
     for t in texts:
@@ -588,42 +559,6 @@ class Seq2SeqTransformer:
         return loss, acc, dlogits
 
     # ------------- Greedy decoding -------------
-
-    # def greedy_decode(self, src_ids: np.ndarray, stoi_tgt: Dict[str, int], itos_tgt: Dict[int, str], max_len: int = 20) -> List[List[str]]:
-    #     self.dropout.training = False
-    #     B, Ts = src_ids.shape
-    #     # encode once
-    #     hs = self.embed_src.forward(src_ids) + self.pos_src.value[:Ts][None, :, :]
-    #     src_pad = (src_ids == SPECIAL_TOKENS["<PAD>"])
-    #     for layer in self.enc_layers:
-    #         hs = layer.forward(hs, training=False, src_pad=src_pad)
-    #     # start tokens
-    #     start = SPECIAL_TOKENS["[start]"]
-    #     end = SPECIAL_TOKENS["[end]"]
-    #     y = np.full((B, 1), start, dtype=np.int64)
-    #     decoded = [[] for _ in range(B)]
-    #     for t in range(max_len):
-    #         ht = self.embed_tgt.forward(y) + self.pos_tgt.value[: y.shape[1]][None, :, :]
-    #         dec_pad = (y == SPECIAL_TOKENS["<PAD>"])
-    #         h = ht
-    #         for layer in self.dec_layers:
-    #             h = layer.forward(h, enc_out=hs, training=False, dec_pad=dec_pad, enc_pad=src_pad)
-    #         logits = self.proj.forward(h)
-    #         probs = self.softmax(logits[:, -1:, :])  # last step
-    #         tok = probs.argmax(axis=-1)  # (B,1)
-    #         y = np.concatenate([y, tok], axis=1)
-    #         for i in range(B):
-    #             decoded[i].append(int(tok[i, 0]))
-    #     # cut at [end]
-    #     outs = []
-    #     for seq in decoded:
-    #         words = []
-    #         for idx in seq:
-    #             if idx == end:
-    #                 break
-    #             words.append(itos_tgt.get(idx, "<OOV>"))
-    #         outs.append(words)
-    #     return outs
     def greedy_decode(self, src_ids, stoi_tgt, itos_tgt, max_len=20):
         self.dropout.training = False
         B, Ts = src_ids.shape
