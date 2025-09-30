@@ -251,8 +251,8 @@ class MultiHeadAttention:
         assert dim_q % num_heads == 0
         assert dim_kv % num_heads == 0
         self.num_heads = num_heads # num_heads=8
-        self.head_q = dim_q // num_heads # head_q = dim_kv = 256 // 8 = 32
-        self.head_kv = dim_kv // num_heads # head_kv = dim_kv = 256 // 8 = 32
+        self.head_q = dim_q // num_heads # head_q = 256 // 8 = 32
+        self.head_kv = dim_kv // num_heads # head_kv = 256 // 8 = 32
         self.Wq = Dense(dim_q, dim_q, name=f"{name}/Wq", seed=seed) # dim_q=256
         self.Wk = Dense(dim_kv, dim_kv, name=f"{name}/Wk", seed=seed + 1) # dim_kv=256
         self.Wv = Dense(dim_kv, dim_kv, name=f"{name}/Wv", seed=seed + 2) # dim_kv=256
@@ -450,7 +450,7 @@ class TransformerDecoderBlock:
 class Seq2SeqTransformer:
     def __init__(self, src_vocab: int, tgt_vocab: int, embed_dim: int = 256, num_heads: int = 8, ff_hidden: int = 1024,
                  num_enc_layers: int = 1, num_dec_layers: int = 1, dropout_p: float = 0.1, max_len: int = 128, seed: int = 0):
-        self.embed_src = Embedding(src_vocab, embed_dim, seed=seed, name="src_emb") # src_vocab = 11912, embed_dim=256
+        self.embed_src = Embedding(src_vocab, embed_dim, seed=seed, name="src_emb") # src_vocab = 12089, embed_dim=256
         self.embed_tgt = Embedding(tgt_vocab, embed_dim, seed=seed + 1, name="tgt_emb") # tgt_vocab = 15000, embed_dim=256
         rng = np.random.default_rng(seed + 7)
         self.pos_src = Parameter(rng.normal(0, 0.02, size=(max_len, embed_dim)).astype(np.float32), "pos/src") # max_len=20, embed_dim=256
@@ -502,7 +502,7 @@ class Seq2SeqTransformer:
         # Final proj to vocab (apply dropout on decoder outputs)
         self.dropout.training = training
         h = self.dropout.forward(ht) # ht.shape = (64,20,256) -> h.shape = (64,20,256)
-        logits = self.proj.forward(h)  # h.shape= (64,20,256) -> logits.shape = (64,20,20004)
+        logits = self.proj.forward(h)  # h.shape= (64,20,256) -> logits.shape = (64,20,15000)
         # cache for backward routing
         self._cache_enc_inputs = (src_pad,)
         self._cache_dec_inputs = (tgt_pad,)
@@ -605,7 +605,7 @@ class Seq2SeqTransformer:
                     break
                 words.append(itos_tgt.get(idx, "<OOV>"))
             outs.append(words)
-        return outs # len (outs) = 64, outs[0] = ['un', 'hombre', 'con', 'un', 'sombrero', '.', '[end]']
+        return outs # len (outs) = 64, outs[0] = ['un', 'hombre', 'con', 'un', 'sombrero', '.']
 
 # =============================================================
 # Optimizer
