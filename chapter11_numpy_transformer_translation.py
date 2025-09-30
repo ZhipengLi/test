@@ -485,14 +485,14 @@ class Seq2SeqTransformer:
 
     def forward(self, src_ids: np.ndarray, tgt_in_ids: np.ndarray, training: bool = True) -> np.ndarray:
         self.training = training
-        B, Ts = src_ids.shape # src_ids.shape = (32, 20), B=32, Ts=20
-        _, Tt = tgt_in_ids.shape # tgt_in_ids.shape = (32, 20), Tt=20
+        _, Ts = src_ids.shape # src_ids.shape = (64, 20), B=64, Ts=20
+        _, Tt = tgt_in_ids.shape # tgt_in_ids.shape = (64, 20), Tt=20
         # Embeddings + positions
-        hs = self.embed_src.forward(src_ids) + self.pos_src.value[:Ts][None, :, :] # self.pos_src.value.shape=(128, 256), hs.shape = (32, 20, 256)
-        ht = self.embed_tgt.forward(tgt_in_ids) + self.pos_tgt.value[:Tt][None, :, :] # self.pos_tgt.value.shape=(128, 256), ht.shape = (32, 20, 256)
+        hs = self.embed_src.forward(src_ids) + self.pos_src.value[:Ts][None, :, :] # self.pos_src.value.shape=(128, 256), hs.shape = (64, 20, 256)
+        ht = self.embed_tgt.forward(tgt_in_ids) + self.pos_tgt.value[:Tt][None, :, :] # self.pos_tgt.value.shape=(128, 256), ht.shape = (64, 20, 256)
         # masks
-        src_pad = (src_ids == SPECIAL_TOKENS["<PAD>"]) # src_pad.shape = (32, 20)
-        tgt_pad = (tgt_in_ids == SPECIAL_TOKENS["<PAD>"]) # tgt_pad.shape = (32, 20)
+        src_pad = (src_ids == SPECIAL_TOKENS["<PAD>"]) # src_pad.shape = (64, 20)
+        tgt_pad = (tgt_in_ids == SPECIAL_TOKENS["<PAD>"]) # tgt_pad.shape = (64, 20)
         # Encoder
         for layer in self.enc_layers: # only 1 layer
             hs = layer.forward(hs, training=training, src_pad=src_pad) # hs.shape = (64,20,256) -> (64,20,256), src_pad.shape = (64,20)
@@ -529,8 +529,8 @@ class Seq2SeqTransformer:
 
     @staticmethod
     def softmax(logits: np.ndarray) -> np.ndarray:
-        m = logits.max(axis=-1, keepdims=True)
-        e = np.exp(logits - m)
+        m = logits.max(axis=-1, keepdims=True) # logits.shape = (64,20,15000), m.shape = (64,20,1)
+        e = np.exp(logits - m) # e.shape = (64,20,15000)
         return e / (e.sum(axis=-1, keepdims=True) + 1e-12)
 
     def loss_and_acc(self, logits: np.ndarray, tgt_out_ids: np.ndarray, pad_id: int = 0) -> Tuple[float, float, np.ndarray]:
